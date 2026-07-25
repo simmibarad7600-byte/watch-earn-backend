@@ -7,33 +7,12 @@ app.use(cors());
 
 let users = {};
 let otpStore = {};
-let requestLogs = {};
 
 // Video Feed Database (Default videos + User uploaded videos)
 let videos = [
   { id: 1, title: "Amazing Nature Shorts", videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", uploader: "admin" },
   { id: 2, title: "Tech Tips & Tricks", videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", uploader: "admin" }
 ];
-
-// Security Middleware
-const securityShield = (req, res, next) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  const now = Date.now();
-
-  if (!requestLogs[ip]) {
-    requestLogs[ip] = { count: 1, lastRequest: now };
-  } else {
-    const timeDiff = now - requestLogs[ip].lastRequest;
-    if (timeDiff < 500) {
-      return res.status(403).json({ success: false, message: "Security Alert: Automated Bot detected!" });
-    }
-    requestLogs[ip].count++;
-    requestLogs[ip].lastRequest = now;
-  }
-  next();
-};
-
-app.use(securityShield);
 
 // Step 1: Send OTP API
 app.post('/api/auth/send-otp', (req, res) => {
@@ -114,7 +93,7 @@ app.post('/api/upload-video', (req, res) => {
 
 // Reward Claim with Creator Commission Share
 app.post('/api/reward', (req, res) => {
-  const { userId, videoId, earnedCoins } = req.body;
+  const { userId, videoId } = req.body;
   if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
 
   const currentTime = Date.now();
@@ -131,7 +110,6 @@ app.post('/api/reward', (req, res) => {
   users[userId].lastClaimTime = currentTime;
   users[userId].history.unshift(`Watched video & earned +${viewerReward} coins`);
 
-  // Find video and give commission to uploader if it belongs to a user
   const targetVideo = videos.find(v => v.id === videoId);
   if (targetVideo && targetVideo.uploader !== "admin" && users[targetVideo.uploader]) {
     users[targetVideo.uploader].coins += creatorCommission;

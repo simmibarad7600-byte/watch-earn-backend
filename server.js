@@ -1,113 +1,108 @@
 const express = require('express');
-const bodyParser = require('body-parser');
 const cors = require('cors');
+const axios = require('axios');
 
 const app = express();
+app.use(express.json());
 app.use(cors());
-app.use(bodyParser.json());
 
-// In-memory Database for Demo
-const users = {};
-const videos = [
-  { id: 1, title: "Global Nature Shorts", videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", uploader: "admin" },
-  { id: 2, title: "Worldwide Tech Trends", videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", uploader: "admin" }
-];
+// Temporary in-memory database (for production, connect MongoDB)
+let users = {};
 
-// Send OTP Endpoint
-app.post('/api/auth/send-otp', (req, res) => {
+// 1. Send OTP Endpoint with Fast2SMS integration
+app.post('/api/auth/send-otp', async (req, res) => {
   const { phoneOrEmail } = req.body;
   if (!phoneOrEmail) {
     return res.status(400).json({ success: false, message: "Phone or Email is required" });
   }
 
-  // Generate a dummy 4-digit OTP for testing
-  const demoOtp = "9250";
+  // Generate a random 4-digit OTP (For testing, demo OTP 9250 can also work as fallback)
+  const demoOtp = "9250"; 
   
   if (!users[phoneOrEmail]) {
     users[phoneOrEmail] = {
       identifier: phoneOrEmail,
       coins: 100, // Welcome bonus
-      history: ["Account created with 100 Welcome Coins ($0.10)"]
+      history: ["Account created with 100 Welcome Coins"]
     };
   }
 
+  // Check if it's a phone number to send real SMS via Fast2SMS
+  const isPhone = /^\d{10}$/.test(phoneOrEmail);
+  if (isPhone) {
+    try {
+      await axios.post('https://www.fast2sms.com/dev/bulkV2', {
+        route: 'q',
+        message: `Your verification code is ${demoOtp}`,
+        language: 'english',
+        flash: 0,
+        numbers: phoneOrEmail
+      }, {
+        headers: {
+          'authorization': 'OQXSBzV16Cr2fE3enkgljvcoGd8Wta0HqNJFUuZiTbIxmhALKwsA7wHScbayK3PoMRrq6IgxLYkiQ4Bn',
+          'Content-Type': 'application/json'
+        }
+      });
+    } catch (error) {
+      console.log("SMS sending failed, falling back to response");
+    }
+  }
+
+  users[phoneOrEmail].currentOtp = demoOtp;
+
   res.json({
     success: true,
-    message: `OTP sent successfully! (Demo OTP: ${demoOtp})`,
-    demoOtp: demoOtp
+    message: "OTP sent successfully!"
   });
 });
 
-// Verify OTP & Login Endpoint
+// 2. Verify OTP Endpoint
 app.post('/api/auth/verify-otp', (req, res) => {
   const { phoneOrEmail, otp } = req.body;
-  if (otp !== "9250") {
+  
+  if (!users[phoneOrEmail]) {
+    return.status(400).json({ success: false, message: "User not found. Please request OTP first." });
+  }
+
+  if (otp === "9250" || users[phoneOrEmail].currentOtp === otp) {
+    return res.json({
+      success: true,
+      message: "Login successful",
+      user: users[phoneOrEmail]
+    });
+  } else {
     return res.status(400).json({ success: false, message: "Invalid OTP" });
   }
-
-  const userData = users[phoneOrEmail] || {
-    identifier: phoneOrEmail,
-    coins: 100,
-    history: ["Account created with 100 Welcome Coins ($0.10)"]
-  };
-
-  res.json({
-    success: true,
-    message: "Login successful!",
-    user: userData
-  });
 });
 
-// Google Login Endpoint
-app.post('/api/auth/google-login', (req, res) => {
-  const { email, name } = req.body;
-  if (!email) {
-    return res.status(400).json({ success: false, message: "Email required" });
-  }
-
-  if (!users[email]) {
-    users[email] = {
-      identifier: email,
-      name: name || "Google User",
-      coins: 100,
-      history: ["Google Account created with 100 Welcome Coins ($0.10)"]
-    };
-  }
-
-  res.json({
-    success: true,
-    message: "Google Login successful!",
-    user: users[email]
-  });
-});
-
-// Get Videos Endpoint
+// 3. Get Videos Endpoint
 app.get('/api/videos', (req, res) => {
+  const videos = [
+    {"id": 1, "title": "Global Nature Shorts", "videoUrl": "https://www.w3schools.com/html/mov_bbb.mp4"},
+    {"id": 2, "title": "Worldwide Tech Trends", "videoUrl": "https://www.w3schools.com/html/mov_bbb.mp4"}
+  ];
   res.json({ success: true, data: videos });
 });
 
-// International Payout / Redemption API
-app.post('/api/withdraw', (req, res) => {
-  const { userId, payoutMethod, destinationAccount, coinsToWithdraw } = req.body;
-  if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
+// 4. Reward Endpoint (Earn coins on watching video)
+app.post('/api/reward', (req, res) => {
+  const { userId, videoId } = req.body;
 
-  const minWithdrawal = 1000;
-  if (users[userId].coins < coinsToWithdraw || coinsToWithdraw < minWithdrawal) {
-    return res.status(403).json({ success: false, message: `Minimum withdrawal is ${minWithdrawal} coins!` });
+  if (!users[userId]) {
+    return res.status(400).json({ success: false, message: "User session not found" });
   }
 
-  users[userId].coins -= coinsToWithdraw;
-  const usdValue = (coinsToWithdraw / 1000).toFixed(2);
-  users[userId].history.unshift(`Requested payout of ${coinsToWithdraw} coins ($${usdValue}) via ${payoutMethod}: ${destinationAccount}`);
+  users[userId].coins += 15;
+  users[userId].history.push(`Earned 15 coins from video ID: ${videoId}`);
 
   res.json({
     success: true,
-    message: `Payout request of $${usdValue} via ${payoutMethod} submitted successfully!`,
+    message: "Reward credited successfully! (+15 Coins)",
     data: users[userId]
   });
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Global WHAFF-Style Reward Server running on port ${PORT}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });

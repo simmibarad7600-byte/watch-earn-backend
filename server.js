@@ -14,15 +14,15 @@ app.get('/', (req, res) => {
 // Temporary in-memory database (for production, connect MongoDB)
 let users = {};
 
-// 1. Send OTP Endpoint with Fast2SMS integration
+// 1. Send OTP Endpoint with Real Random OTP via Fast2SMS
 app.post('/api/auth/send-otp', async (req, res) => {
   const { phoneOrEmail } = req.body;
   if (!phoneOrEmail) {
     return res.status(400).json({ success: false, message: "Phone or Email is required" });
   }
 
-  // Generate a random 4-digit OTP (For testing, demo OTP 9250 can also work as fallback)
-  const demoOtp = "9250"; 
+  // Generate a random 4-digit real OTP (1000 to 9999)
+  const realOtp = Math.floor(1000 + Math.random() * 9000).toString();
   
   if (!users[phoneOrEmail]) {
     users[phoneOrEmail] = {
@@ -32,13 +32,16 @@ app.post('/api/auth/send-otp', async (req, res) => {
     };
   }
 
+  // Save the newly generated real OTP to the user session
+  users[phoneOrEmail].currentOtp = realOtp;
+
   // Check if it's a phone number to send real SMS via Fast2SMS
   const isPhone = /^\d{10}$/.test(phoneOrEmail);
   if (isPhone) {
     try {
       await axios.post('https://www.fast2sms.com/dev/bulkV2', {
         route: 'q',
-        message: `Your verification code is ${demoOtp}`,
+        message: `Your verification code is ${realOtp}`,
         language: 'english',
         flash: 0,
         numbers: phoneOrEmail
@@ -49,15 +52,13 @@ app.post('/api/auth/send-otp', async (req, res) => {
         }
       });
     } catch (error) {
-      console.log("SMS sending failed, falling back to response");
+      console.log("SMS sending failed:", error);
     }
   }
 
-  users[phoneOrEmail].currentOtp = demoOtp;
-
   return res.json({
     success: true,
-    message: "OTP sent successfully!"
+    message: "Real OTP sent successfully!"
   });
 });
 
@@ -69,7 +70,8 @@ app.post('/api/auth/verify-otp', (req, res) => {
     return res.status(400).json({ success: false, message: "User not found. Please request OTP first." });
   }
 
-  if (otp === "9250" || users[phoneOrEmail].currentOtp === otp) {
+  // Verify against the actual generated OTP sent to the user
+  if (users[phoneOrEmail].currentOtp === otp) {
     return res.json({
       success: true,
       message: "Login successful",

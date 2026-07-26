@@ -61,7 +61,7 @@ app.post('/api/auth/verify-otp', (req, res) => {
   const { phoneOrEmail, otp } = req.body;
   
   if (!users[phoneOrEmail]) {
-    return.status(400).json({ success: false, message: "User not found. Please request OTP first." });
+    return res.status(400).json({ success: false, message: "User not found. Please request OTP first." });
   }
 
   if (otp === "9250" || users[phoneOrEmail].currentOtp === otp) {

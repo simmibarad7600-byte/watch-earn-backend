@@ -35,7 +35,7 @@ app.post('/api/auth/send-otp', (req, res) => {
   res.json({ success: true, message: `OTP sent successfully! (Demo OTP: ${otp})` });
 });
 
-// Step 2: Verify OTP & Login/Register with International Welcome Bonus
+// Step 2: Verify OTP & Login/Register
 app.post('/api/auth/verify-otp', (req, res) => {
   const { identifier, otp, referralCode } = req.body;
   
@@ -46,8 +46,8 @@ app.post('/api/auth/verify-otp', (req, res) => {
   if (!users[identifier]) {
     users[identifier] = { 
       userId: identifier, 
-      coins: 100, // Global welcome bonus
-      usdBalance: 1.00, // International USD equivalent tracker ($1.00 = 1000 coins)
+      coins: 100, 
+      usdBalance: 0.10, 
       lastClaimTime: 0, 
       lastCheckInDate: "",
       streakCount: 0,
@@ -66,6 +66,42 @@ app.post('/api/auth/verify-otp', (req, res) => {
 
   delete otpStore[identifier];
   res.json({ success: true, message: "Login successful", data: users[identifier] });
+});
+
+// New: Google / Social Login API (International 1-Click Login)
+app.post('/api/auth/social-login', (req, res) => {
+  const { email, name, provider, referralCode } = req.body;
+  
+  if (!email) {
+    return res.status(400).json({ success: false, message: "Email is required for social login" });
+  }
+
+  const userId = email;
+
+  if (!users[userId]) {
+    users[userId] = { 
+      userId: userId, 
+      name: name || "Global User",
+      provider: provider || "Google",
+      coins: 100, // Welcome bonus for social login
+      usdBalance: 0.10, 
+      lastClaimTime: 0, 
+      lastCheckInDate: "",
+      streakCount: 0,
+      completedOffers: [],
+      history: [`Account created via ${provider || 'Google'} with 100 Welcome Coins`] 
+    };
+
+    if (referralCode && users[referralCode] && referralCode !== userId) {
+      users[userId].coins += 50;
+      users[userId].history.unshift("Bonus +50 coins for using global referral code");
+
+      users[referralCode].coins += 100;
+      users[referralCode].history.unshift(`Global referral bonus! Earned +100 coins from ${userId}`);
+    }
+  }
+
+  res.json({ success: true, message: `Logged in successfully via ${provider || 'Google'}`, data: users[userId] });
 });
 
 // Get User Profile & Global Wallet Status
@@ -87,7 +123,7 @@ app.get('/api/offers', (req, res) => {
   res.json({ success: true, data: globalOffers });
 });
 
-// Complete Offer Task (WHAFF style app install/survey earnings)
+// Complete Offer Task
 app.post('/api/complete-offer', (req, res) => {
   const { userId, offerId } = req.body;
   if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
@@ -125,7 +161,7 @@ app.post('/api/upload-video', (req, res) => {
   res.json({ success: true, message: "Video published successfully for global creators!", data: newVideo });
 });
 
-// Watch & Earn Reward with Anti-Cheat & Creator Share
+// Watch & Earn Reward
 app.post('/api/reward', (req, res) => {
   const { userId, videoId } = req.body;
   if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
@@ -164,7 +200,7 @@ app.post('/api/daily-checkin', (req, res) => {
   }
 
   users[userId].streakCount = (users[userId].streakCount || 0) + 1;
-  const streakBonus = users[userId].streakCount * 25; // Progressive streak bonus
+  const streakBonus = users[userId].streakCount * 25;
 
   users[userId].coins += streakBonus;
   users[userId].lastCheckInDate = today;
@@ -173,12 +209,12 @@ app.post('/api/daily-checkin', (req, res) => {
   res.json({ success: true, message: `Streak Day ${users[userId].streakCount}! +${streakBonus} Coins added.`, data: users[userId] });
 });
 
-// International Payout / Redemption API (PayPal, Gift Cards, Crypto, UPI)
+// International Payout / Redemption API
 app.post('/api/withdraw', (req, res) => {
   const { userId, payoutMethod, destinationAccount, coinsToWithdraw } = req.body;
   if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
 
-  const minWithdrawal = 1000; // 1000 coins = $1.00 / ₹80
+  const minWithdrawal = 1000;
   if (users[userId].coins < coinsToWithdraw || coinsToWithdraw < minWithdrawal) {
     return res.status(403).json({ success: false, message: `Minimum withdrawal is ${minWithdrawal} coins!` });
   }
@@ -189,7 +225,7 @@ app.post('/api/withdraw', (req, res) => {
 
   res.json({ 
     success: true, 
-    message: `Payout request of $${usdValue} via ${payoutMethod} submitted successfully! Processed within 24 hours.`, 
+    message: `Payout request of $${usdValue} via ${payoutMethod} submitted successfully!`, 
     data: users[userId] 
   });
 });

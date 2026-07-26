@@ -6,6 +6,11 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Home route to check if backend is running
+app.get('/', (req, res) => {
+  res.send('Watch & Earn Backend is Running Successfully!');
+});
+
 // Temporary in-memory database (for production, connect MongoDB)
 let users = {};
 
@@ -50,7 +55,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
 
   users[phoneOrEmail].currentOtp = demoOtp;
 
-  res.json({
+  return res.json({
     success: true,
     message: "OTP sent successfully!"
   });
@@ -81,7 +86,7 @@ app.get('/api/videos', (req, res) => {
     {"id": 1, "title": "Global Nature Shorts", "videoUrl": "https://www.w3schools.com/html/mov_bbb.mp4"},
     {"id": 2, "title": "Worldwide Tech Trends", "videoUrl": "https://www.w3schools.com/html/mov_bbb.mp4"}
   ];
-  res.json({ success: true, data: videos });
+  return res.json({ success: true, data: videos });
 });
 
 // 4. Reward Endpoint (Earn coins on watching video)
@@ -95,7 +100,7 @@ app.post('/api/reward', (req, res) => {
   users[userId].coins += 15;
   users[userId].history.push(`Earned 15 coins from video ID: ${videoId}`);
 
-  res.json({
+  return res.json({
     success: true,
     message: "Reward credited successfully! (+15 Coins)",
     data: users[userId]

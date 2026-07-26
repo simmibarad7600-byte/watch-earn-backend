@@ -8,10 +8,17 @@ app.use(cors());
 let users = {};
 let otpStore = {};
 
-// Video Feed Database (Default videos + User uploaded videos)
+// Video Feed Database
 let videos = [
-  { id: 1, title: "Amazing Nature Shorts", videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", uploader: "admin" },
-  { id: 2, title: "Tech Tips & Tricks", videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", uploader: "admin" }
+  { id: 1, title: "Global Nature Shorts", videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", uploader: "admin" },
+  { id: 2, title: "Worldwide Tech Trends", videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4", uploader: "admin" }
+];
+
+// Global Offer Wall Tasks (WHAFF style app installs / tasks)
+let globalOffers = [
+  { id: 101, title: "Install & Register Social App", reward: 150, packageName: "com.social.app", type: "app_install" },
+  { id: 102, title: "Play Fantasy Game Level 5", reward: 300, packageName: "com.game.fantasy", type: "game_task" },
+  { id: 103, title: "Complete Global Market Survey", reward: 100, packageName: "survey_portal", type: "survey" }
 ];
 
 // Step 1: Send OTP API
@@ -24,11 +31,11 @@ app.post('/api/auth/send-otp', (req, res) => {
   const otp = Math.floor(1000 + Math.random() * 9000).toString();
   otpStore[identifier] = otp;
 
-  console.log(`[SECURE OTP FOR ${identifier}]: ${otp}`);
+  console.log(`[GLOBAL OTP FOR ${identifier}]: ${otp}`);
   res.json({ success: true, message: `OTP sent successfully! (Demo OTP: ${otp})` });
 });
 
-// Step 2: Verify OTP & Login/Register
+// Step 2: Verify OTP & Login/Register with International Welcome Bonus
 app.post('/api/auth/verify-otp', (req, res) => {
   const { identifier, otp, referralCode } = req.body;
   
@@ -39,18 +46,21 @@ app.post('/api/auth/verify-otp', (req, res) => {
   if (!users[identifier]) {
     users[identifier] = { 
       userId: identifier, 
-      coins: 50, 
+      coins: 100, // Global welcome bonus
+      usdBalance: 1.00, // International USD equivalent tracker ($1.00 = 1000 coins)
       lastClaimTime: 0, 
       lastCheckInDate: "",
-      history: ["Account created with 50 Welcome Coins"] 
+      streakCount: 0,
+      completedOffers: [],
+      history: ["Account created with 100 Welcome Coins ($0.10)"] 
     };
 
     if (referralCode && users[referralCode] && referralCode !== identifier) {
-      users[identifier].coins += 25;
-      users[identifier].history.unshift("Bonus +25 coins for using referral code");
+      users[identifier].coins += 50;
+      users[identifier].history.unshift("Bonus +50 coins for using global referral code");
 
-      users[referralCode].coins += 50;
-      users[referralCode].history.unshift(`Referral bonus! Earned +50 coins from ${identifier}`);
+      users[referralCode].coins += 100;
+      users[referralCode].history.unshift(`Global referral bonus! Earned +100 coins from ${identifier}`);
     }
   }
 
@@ -58,21 +68,45 @@ app.post('/api/auth/verify-otp', (req, res) => {
   res.json({ success: true, message: "Login successful", data: users[identifier] });
 });
 
-// Get User Profile
+// Get User Profile & Global Wallet Status
 app.get('/api/user/:userId', (req, res) => {
   const userId = req.params.userId;
   if (!users[userId]) {
-    users[userId] = { userId: userId, coins: 50, lastClaimTime: 0, lastCheckInDate: "", history: [] };
+    users[userId] = { userId: userId, coins: 100, usdBalance: 0.10, lastClaimTime: 0, lastCheckInDate: "", streakCount: 0, completedOffers: [], history: [] };
   }
   res.json({ success: true, data: users[userId] });
 });
 
-// Get All Videos API
+// Get Videos Feed
 app.get('/api/videos', (req, res) => {
   res.json({ success: true, data: videos });
 });
 
-// Upload Video API (Creator Revenue Share)
+// Get Global Offer Wall Tasks
+app.get('/api/offers', (req, res) => {
+  res.json({ success: true, data: globalOffers });
+});
+
+// Complete Offer Task (WHAFF style app install/survey earnings)
+app.post('/api/complete-offer', (req, res) => {
+  const { userId, offerId } = req.body;
+  if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
+
+  const offer = globalOffers.find(o => o.id === offerId);
+  if (!offer) return res.status(400).json({ success: false, message: "Offer not found" });
+
+  if (users[userId].completedOffers.includes(offerId)) {
+    return res.status(403).json({ success: false, message: "Offer already completed!" });
+  }
+
+  users[userId].completedOffers.push(offerId);
+  users[userId].coins += offer.reward;
+  users[userId].history.unshift(`Completed task "${offer.title}" & earned +${offer.reward} coins`);
+
+  res.json({ success: true, message: `Successfully earned +${offer.reward} coins!`, data: users[userId] });
+});
+
+// Upload Video API
 app.post('/api/upload-video', (req, res) => {
   const { userId, title, videoUrl } = req.body;
   if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
@@ -86,12 +120,12 @@ app.post('/api/upload-video', (req, res) => {
   };
 
   videos.unshift(newVideo);
-  users[userId].history.unshift(`Uploaded video: "${title}" (Creator Program Active)`);
+  users[userId].history.unshift(`Published global video: "${title}"`);
 
-  res.json({ success: true, message: "Video uploaded successfully! You will earn commission when others watch it.", data: newVideo });
+  res.json({ success: true, message: "Video published successfully for global creators!", data: newVideo });
 });
 
-// Reward Claim with Creator Commission Share
+// Watch & Earn Reward with Anti-Cheat & Creator Share
 app.post('/api/reward', (req, res) => {
   const { userId, videoId } = req.body;
   if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
@@ -100,10 +134,10 @@ app.post('/api/reward', (req, res) => {
   const timeDifference = (currentTime - users[userId].lastClaimTime) / 1000;
 
   if (users[userId].lastClaimTime !== 0 && timeDifference < 9.5) {
-    return res.status(403).json({ success: false, message: "Cheat Detected! Request blocked." });
+    return res.status(403).json({ success: false, message: "Security Alert: Watch timer violated!" });
   }
 
-  const viewerReward = 10;
+  const viewerReward = 15;
   const creatorCommission = 5;
 
   users[userId].coins += viewerReward;
@@ -113,45 +147,54 @@ app.post('/api/reward', (req, res) => {
   const targetVideo = videos.find(v => v.id === videoId);
   if (targetVideo && targetVideo.uploader !== "admin" && users[targetVideo.uploader]) {
     users[targetVideo.uploader].coins += creatorCommission;
-    users[targetVideo.uploader].history.unshift(`Creator earnings! Earned +${creatorCommission} coins from your video "${targetVideo.title}"`);
+    users[targetVideo.uploader].history.unshift(`Global creator commission! Earned +${creatorCommission} coins from "${targetVideo.title}"`);
   }
 
-  res.json({ success: true, message: "Coins added securely!", data: users[userId] });
+  res.json({ success: true, message: "Reward credited!", data: users[userId] });
 });
 
-// Daily Check-in Bonus API
+// Global Daily Check-in Streak System
 app.post('/api/daily-checkin', (req, res) => {
   const { userId } = req.body;
   if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
 
   const today = new Date().toDateString();
   if (users[userId].lastCheckInDate === today) {
-    return res.status(403).json({ success: false, message: "Daily bonus already claimed today!" });
+    return res.status(403).json({ success: false, message: "Daily check-in already claimed today!" });
   }
 
-  users[userId].coins += 50;
-  users[userId].lastCheckInDate = today;
-  users[userId].history.unshift("Claimed Daily Check-in Bonus (+50 Coins)");
+  users[userId].streakCount = (users[userId].streakCount || 0) + 1;
+  const streakBonus = users[userId].streakCount * 25; // Progressive streak bonus
 
-  res.json({ success: true, message: "Daily bonus claimed successfully!", data: users[userId] });
+  users[userId].coins += streakBonus;
+  users[userId].lastCheckInDate = today;
+  users[userId].history.unshift(`Claimed Day ${users[userId].streakCount} Check-in Bonus (+${streakBonus} Coins)`);
+
+  res.json({ success: true, message: `Streak Day ${users[userId].streakCount}! +${streakBonus} Coins added.`, data: users[userId] });
 });
 
-// Withdrawal API
+// International Payout / Redemption API (PayPal, Gift Cards, Crypto, UPI)
 app.post('/api/withdraw', (req, res) => {
-  const { userId, upiId, coinsToWithdraw } = req.body;
+  const { userId, payoutMethod, destinationAccount, coinsToWithdraw } = req.body;
   if (!users[userId]) return res.status(400).json({ success: false, message: "User not found" });
 
-  if (users[userId].coins < coinsToWithdraw) {
-    return res.status(403).json({ success: false, message: "Insufficient balance!" });
+  const minWithdrawal = 1000; // 1000 coins = $1.00 / ₹80
+  if (users[userId].coins < coinsToWithdraw || coinsToWithdraw < minWithdrawal) {
+    return res.status(403).json({ success: false, message: `Minimum withdrawal is ${minWithdrawal} coins!` });
   }
 
   users[userId].coins -= coinsToWithdraw;
-  users[userId].history.unshift(`Withdrew ${coinsToWithdraw} coins to UPI: ${upiId}`);
+  const usdValue = (coinsToWithdraw / 1000).toFixed(2);
+  users[userId].history.unshift(`Requested payout of ${coinsToWithdraw} coins ($${usdValue}) via ${payoutMethod}: ${destinationAccount}`);
 
-  res.json({ success: true, message: `Successfully withdrew to UPI: ${upiId}`, data: users[userId] });
+  res.json({ 
+    success: true, 
+    message: `Payout request of $${usdValue} via ${payoutMethod} submitted successfully! Processed within 24 hours.`, 
+    data: users[userId] 
+  });
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`Creator Economy & Secure Server running on port ${PORT}`);
+  console.log(`Global WHAFF-Style Reward Server running on port ${PORT}`);
 });

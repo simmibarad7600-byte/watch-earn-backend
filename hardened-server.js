@@ -332,6 +332,7 @@ async function verifyAdMobCallback(originalUrl) {
   const params = new URLSearchParams(signedContent);
   return {
     adUnit: params.get('ad_unit'),
+    customData: params.get('custom_data'),
     rewardAmount: Number(params.get('reward_amount')),
     rewardItem: params.get('reward_item'),
     timestamp: normalizeAdMobTimestamp(params.get('timestamp')),
@@ -691,6 +692,13 @@ app.post(
 app.get('/admob/reward', async (request, response) => {
   try {
     const callback = await verifyAdMobCallback(request.originalUrl);
+    if (
+      callback.uid === 'admob_ssv_setup_check' &&
+      callback.customData === 'verify_only'
+    ) {
+      console.info('Verified AdMob SSV setup callback.');
+      return response.status(200).send('OK');
+    }
     const result = await grantVerifiedAdReward(callback);
     console.info('Verified AdMob reward callback processed:', {
       transactionId: callback.transactionId,

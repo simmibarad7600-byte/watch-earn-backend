@@ -27,7 +27,7 @@ const ADMOB_REWARDED_AD_UNIT_ID = String(
 ).trim();
 const ADMOB_REWARD_AMOUNT = Number(process.env.ADMOB_REWARD_AMOUNT || 1);
 const COINS_PER_REWARD = Number(process.env.COINS_PER_REWARD || 1);
-const DAILY_REWARD_LIMIT = Number(process.env.DAILY_REWARD_LIMIT || 10);
+const DAILY_REWARD_LIMIT = Number(process.env.DAILY_REWARD_LIMIT || 15);
 const ADMOB_KEYS_URL =
   'https://www.gstatic.com/admob/reward/verifier-keys.json';
 

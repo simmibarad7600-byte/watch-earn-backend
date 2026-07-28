@@ -47,6 +47,7 @@ app.use(
 );
 
 const attempts = new Map();
+const otpRecords = new Map();
 
 function rateLimit({ windowMs, limit, message }) {
   return (request, response, next) => {
@@ -88,13 +89,52 @@ function validOtp(value) {
 }
 
 function requireOtpConfiguration() {
-  const missing = [];
-  if (!process.env.FAST2SMS_API_KEY) missing.push('FAST2SMS_API_KEY');
-  if (!process.env.FAST2SMS_OTP_ID) missing.push('FAST2SMS_OTP_ID');
-  if (missing.length > 0) {
+  if (!process.env.FAST2SMS_API_KEY) {
     const error = new Error('OTP service is not configured yet.');
     error.statusCode = 503;
-    error.logMessage = `Missing Railway variables: ${missing.join(', ')}`;
+    error.logMessage = 'Missing Railway variable: FAST2SMS_API_KEY';
+    throw error;
+  }
+}
+
+function hashOtp(mobile, otp, salt) {
+  return crypto
+    .createHash('sha256')
+    .update(`${mobile}:${otp}:${salt}`)
+    .digest();
+}
+
+function storeOtp(mobile, otp) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  otpRecords.set(mobile, {
+    salt,
+    hash: hashOtp(mobile, otp, salt),
+    expiresAt: Date.now() + 5 * 60 * 1000,
+    attempts: 0,
+  });
+}
+
+function verifyStoredOtp(mobile, otp) {
+  const record = otpRecords.get(mobile);
+  if (!record) {
+    const error = new Error('Request a new OTP first.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (record.expiresAt <= Date.now()) {
+    otpRecords.delete(mobile);
+    const error = new Error('OTP has expired. Request a new OTP.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  record.attempts += 1;
+  const suppliedHash = hashOtp(mobile, otp, record.salt);
+  if (!crypto.timingSafeEqual(record.hash, suppliedHash)) {
+    if (record.attempts >= 5) otpRecords.delete(mobile);
+    const error = new Error('Incorrect OTP.');
+    error.statusCode = 400;
     throw error;
   }
 }
@@ -203,12 +243,25 @@ app.post('/otp/send', sendOtpLimiter, async (request, response) => {
   }
 
   try {
-    const result = await fast2smsRequest('/dev/otp/send', {
-      mobile,
-      otp_id: process.env.FAST2SMS_OTP_ID,
-      otp_expiry: 5,
-      otp_length: 6,
-    });
+    let result;
+    if (process.env.FAST2SMS_OTP_ID) {
+      result = await fast2smsRequest('/dev/otp/send', {
+        mobile,
+        otp_id: process.env.FAST2SMS_OTP_ID,
+        otp_expiry: 5,
+        otp_length: 6,
+      });
+    } else {
+      const otp = crypto.randomInt(100000, 1000000).toString();
+      result = await fast2smsRequest('/dev/bulkV2', {
+        route: 'q',
+        message:
+          `Your Watch & Earn OTP is ${otp}. ` +
+          'It expires in 5 minutes. Do not share it.',
+        numbers: mobile,
+      });
+      storeOtp(mobile, otp);
+    }
     return response.json({
       success: true,
       requestId: result.request_id || null,
@@ -235,9 +288,14 @@ app.post('/otp/verify', verifyOtpLimiter, async (request, response) => {
   }
 
   try {
-    await fast2smsRequest('/dev/otp/verify', { mobile, otp });
+    if (process.env.FAST2SMS_OTP_ID) {
+      await fast2smsRequest('/dev/otp/verify', { mobile, otp });
+    } else {
+      verifyStoredOtp(mobile, otp);
+    }
     const uid = `phone_91${mobile}`;
     const customToken = createFirebaseCustomToken(uid);
+    if (!process.env.FAST2SMS_OTP_ID) otpRecords.delete(mobile);
     return response.json({
       success: true,
       customToken,

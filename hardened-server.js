@@ -34,6 +34,12 @@ const REFERRAL_QUALIFYING_ADS = Number(
 const REFERRAL_REWARD_COINS = Number(
   process.env.REFERRAL_REWARD_COINS || 1,
 );
+const BITLABS_ENABLED =
+  String(process.env.BITLABS_ENABLED || 'false').toLowerCase() === 'true';
+const BITLABS_APP_SECRET = String(process.env.BITLABS_APP_SECRET || '').trim();
+const BITLABS_MAX_COINS_PER_CALLBACK = Number(
+  process.env.BITLABS_MAX_COINS_PER_CALLBACK || 100,
+);
 const ADMOB_KEYS_URL =
   'https://www.gstatic.com/admob/reward/verifier-keys.json';
 
@@ -330,6 +336,58 @@ function verifyEcdsaSignature(publicKey, signedContent, signatureValue) {
   );
 }
 
+function stripBitLabsHash(fullUrl) {
+  return String(fullUrl || '').replace(/([?&])hash=[^&]*(&?)/i, (_match, lead, tail) => {
+    if (lead === '?' && tail) return '?';
+    return tail ? lead : '';
+  });
+}
+
+function bitLabsSignature(fullUrlWithoutHash, secret) {
+  return crypto
+    .createHmac('sha1', String(secret || ''))
+    .update(String(fullUrlWithoutHash || ''), 'utf8')
+    .digest('hex');
+}
+
+function safeHexEqual(expected, supplied) {
+  const left = Buffer.from(String(expected || '').toLowerCase(), 'utf8');
+  const right = Buffer.from(String(supplied || '').toLowerCase(), 'utf8');
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function verifyBitLabsCallback(fullUrl, secret) {
+  if (!secret) throw new Error('BitLabs secret is not configured.');
+  const parsed = new URL(String(fullUrl || ''));
+  const suppliedHash = parsed.searchParams.get('hash');
+  if (!/^[a-f0-9]{40}$/i.test(String(suppliedHash || ''))) {
+    throw new Error('Malformed BitLabs callback hash.');
+  }
+
+  const unsignedUrl = stripBitLabsHash(fullUrl);
+  const expectedHash = bitLabsSignature(unsignedUrl, secret);
+  if (!safeHexEqual(expectedHash, suppliedHash)) {
+    throw new Error('Invalid BitLabs callback signature.');
+  }
+
+  const uid = parsed.searchParams.get('uid');
+  const transactionId = parsed.searchParams.get('tx');
+  const coins = Number(parsed.searchParams.get('val'));
+  const usdValue = Number(parsed.searchParams.get('raw'));
+  if (
+    !validFirebaseUid(uid) ||
+    !/^[A-Za-z0-9:_-]{1,128}$/.test(String(transactionId || '')) ||
+    !Number.isSafeInteger(coins) ||
+    coins < 1 ||
+    coins > BITLABS_MAX_COINS_PER_CALLBACK ||
+    !Number.isFinite(usdValue) ||
+    usdValue < 0
+  ) {
+    throw new Error('BitLabs callback values failed validation.');
+  }
+  return { uid, transactionId, coins, usdValue };
+}
+
 async function getAdMobPublicKeys() {
   const now = Date.now();
   if (admobKeyCache.expiresAt > now && admobKeyCache.keys.size > 0) {
@@ -496,6 +554,65 @@ async function grantVerifiedAdReward(callback) {
       coins: COINS_PER_REWARD,
       lifetimeVerifiedAds,
     };
+  });
+}
+
+async function grantBitLabsOfferReward(callback) {
+  const { uid, transactionId, coins, usdValue } = callback;
+  const authUser = await firebaseAuth.getUser(uid);
+  const verifiedAccount =
+    authUser.emailVerified === true ||
+    Boolean(authUser.phoneNumber) ||
+    authUser.customClaims?.phone_verified === true;
+  if (!verifiedAccount) throw new Error('Offer user is not verified.');
+
+  const claimRef = firestore.collection('offerClaims').doc(transactionId);
+  const walletRef = firestore.collection('wallets').doc(uid);
+  const userRef = firestore.collection('users').doc(uid);
+  const transactionRef = firestore
+    .collection('transactions')
+    .doc(`bitlabs_${transactionId}`);
+
+  return firestore.runTransaction(async (transaction) => {
+    const [claimSnapshot, userSnapshot, walletSnapshot] = await Promise.all([
+      transaction.get(claimRef),
+      transaction.get(userRef),
+      transaction.get(walletRef),
+    ]);
+    if (claimSnapshot.exists) return { duplicate: true, credited: false };
+    if (!userSnapshot.exists) throw new Error('Offer user does not exist.');
+
+    const currentCoins = Number(walletSnapshot.data()?.coins || 0);
+    const nextCoins = currentCoins + coins;
+    transaction.set(
+      walletRef,
+      {
+        uid,
+        coins: nextCoins,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    transaction.create(claimRef, {
+      provider: 'bitlabs',
+      userId: uid,
+      providerTransactionId: transactionId,
+      coins,
+      usdValue,
+      credited: true,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    transaction.create(transactionRef, {
+      userId: uid,
+      type: 'offer_reward',
+      provider: 'bitlabs',
+      coins,
+      balanceAfter: nextCoins,
+      providerTransactionId: transactionId,
+      providerUsdValue: usdValue,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    return { duplicate: false, credited: true, coins };
   });
 }
 
@@ -1272,6 +1389,37 @@ app.get('/admob/reward', async (request, response) => {
   }
 });
 
+app.get('/bitlabs/reward', async (request, response) => {
+  if (!BITLABS_ENABLED) {
+    return response.status(503).send('Provider disabled');
+  }
+  try {
+    const forwardedProtocol = String(
+      request.headers['x-forwarded-proto'] || request.protocol,
+    )
+      .split(',')[0]
+      .trim();
+    const forwardedHost = String(
+      request.headers['x-forwarded-host'] || request.get('host'),
+    )
+      .split(',')[0]
+      .trim();
+    const fullUrl =
+      `${forwardedProtocol}://${forwardedHost}${request.originalUrl}`;
+    const callback = verifyBitLabsCallback(fullUrl, BITLABS_APP_SECRET);
+    const result = await grantBitLabsOfferReward(callback);
+    console.info('Verified BitLabs reward callback processed:', {
+      transactionId: callback.transactionId,
+      credited: result.credited,
+      duplicate: result.duplicate,
+    });
+    return response.status(200).send('OK');
+  } catch (error) {
+    console.warn('Rejected BitLabs reward callback:', error.message);
+    return response.status(400).send('Invalid callback');
+  }
+});
+
 app.use((_request, response) => {
   response.status(404).json({ success: false, message: 'Route not found.' });
 });
@@ -1314,5 +1462,8 @@ module.exports = {
   validOtp,
   validFirebaseUid,
   normalizeAdMobTimestamp,
+  bitLabsSignature,
+  stripBitLabsHash,
+  verifyBitLabsCallback,
   verifyEcdsaSignature,
 };

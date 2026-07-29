@@ -115,7 +115,11 @@ app.use(
       }
     },
     methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type', 'X-Firebase-AppCheck'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Firebase-AppCheck',
+    ],
     maxAge: 600,
   }),
 );
@@ -139,6 +143,17 @@ const verifyOtpIpLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many OTP attempts. Please try again later.',
+  },
+});
+
+const dailyBonusIpLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many bonus requests. Please try again later.',
   },
 });
 
@@ -257,6 +272,22 @@ function maskMobile(mobile) {
 
 function validFirebaseUid(value) {
   return /^[A-Za-z0-9:_-]{1,128}$/.test(String(value || ''));
+}
+
+function utcDay(value = new Date()) {
+  return value.toISOString().slice(0, 10);
+}
+
+function previousUtcDay(day) {
+  const date = new Date(`${day}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() - 1);
+  return utcDay(date);
+}
+
+function nextDailyStreak(lastClaimDay, currentStreak, today) {
+  return lastClaimDay === previousUtcDay(today)
+    ? Math.max(0, Number(currentStreak || 0)) + 1
+    : 1;
 }
 
 function normalizeAdMobTimestamp(value) {
@@ -466,6 +497,95 @@ async function verifyAppCheck(request, response, next) {
     }
     return next();
   }
+}
+
+async function verifyFirebaseUser(request, response, next) {
+  const authorization = request.get('Authorization') || '';
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return response.status(401).json({
+      success: false,
+      message: 'Please log in again.',
+    });
+  }
+
+  try {
+    request.firebaseUser = await firebaseAuth.verifyIdToken(match[1], true);
+    return next();
+  } catch (error) {
+    console.warn('Invalid Firebase ID token:', error.code || error.message);
+    return response.status(401).json({
+      success: false,
+      message: 'Your login expired. Please log in again.',
+    });
+  }
+}
+
+async function grantDailyBonus(uid) {
+  const today = utcDay();
+  const claimId = `${uid}_${today}`;
+  const claimRef = firestore.collection('dailyClaims').doc(claimId);
+  const walletRef = firestore.collection('wallets').doc(uid);
+  const transactionRef = firestore.collection('transactions').doc(claimId);
+
+  return firestore.runTransaction(async (transaction) => {
+    const [claimSnapshot, walletSnapshot] = await Promise.all([
+      transaction.get(claimRef),
+      transaction.get(walletRef),
+    ]);
+
+    if (claimSnapshot.exists) {
+      return {
+        claimed: false,
+        alreadyClaimed: true,
+        streak: Number(walletSnapshot.data()?.dailyBonusStreak || 0),
+        coins: 0,
+      };
+    }
+
+    const wallet = walletSnapshot.data() || {};
+    const streak = nextDailyStreak(
+      wallet.dailyBonusLastClaimDate,
+      wallet.dailyBonusStreak,
+      today,
+    );
+    const rewardCoins = streak % 7 === 0 ? 2 : 1;
+    const nextBalance = Number(wallet.coins || 0) + rewardCoins;
+
+    transaction.create(claimRef, {
+      userId: uid,
+      day: today,
+      streak,
+      coins: rewardCoins,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    transaction.set(
+      walletRef,
+      {
+        coins: nextBalance,
+        dailyBonusLastClaimDate: today,
+        dailyBonusStreak: streak,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    transaction.create(transactionRef, {
+      userId: uid,
+      type: 'daily_bonus',
+      coins: rewardCoins,
+      balanceAfter: nextBalance,
+      streak,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+
+    return {
+      claimed: true,
+      alreadyClaimed: false,
+      streak,
+      coins: rewardCoins,
+      balance: nextBalance,
+    };
+  });
 }
 
 async function fast2smsRequest(endpoint, body) {
@@ -689,6 +809,40 @@ app.post(
   },
 );
 
+app.post(
+  '/rewards/daily-check-in',
+  dailyBonusIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, [])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+
+    try {
+      const result = await grantDailyBonus(request.firebaseUser.uid);
+      return response.json({
+        success: true,
+        ...result,
+        message: result.alreadyClaimed
+          ? 'Today’s bonus is already claimed.'
+          : `Daily bonus claimed: +${result.coins} coin${
+              result.coins === 1 ? '' : 's'
+            }.`,
+      });
+    } catch (error) {
+      console.error('Daily bonus failed:', error.message);
+      return response.status(500).json({
+        success: false,
+        message: 'Daily bonus is temporarily unavailable.',
+      });
+    }
+  },
+);
+
 app.get('/admob/reward', async (request, response) => {
   try {
     const callback = await verifyAdMobCallback(request.originalUrl);
@@ -746,6 +900,9 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  nextDailyStreak,
+  previousUtcDay,
+  utcDay,
   validIndianMobile,
   validOtp,
   validFirebaseUid,

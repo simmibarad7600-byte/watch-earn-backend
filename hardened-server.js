@@ -671,6 +671,102 @@ async function finalizeQualifiedReferral(referredUid) {
   });
 }
 
+async function redeemPromoCode(uid, code, firebaseUser) {
+  if (!validRewardCode(code)) {
+    const error = new Error('Invalid promo code.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!firebaseUser.email_verified && !firebaseUser.phone_number) {
+    const error = new Error(
+      'Verify your email or phone before using a promo code.',
+    );
+    error.statusCode = 403;
+    throw error;
+  }
+
+  const normalizedCode = String(code).trim().toUpperCase();
+  const promoRef = firestore.collection('promoCodes').doc(normalizedCode);
+  const claimRef = firestore
+    .collection('promoClaims')
+    .doc(`${normalizedCode}_${uid}`);
+  const walletRef = firestore.collection('wallets').doc(uid);
+  const transactionRef = firestore
+    .collection('transactions')
+    .doc(`promo_${normalizedCode}_${uid}`);
+
+  return firestore.runTransaction(async (transaction) => {
+    const [promoSnapshot, claimSnapshot, walletSnapshot] = await Promise.all([
+      transaction.get(promoRef),
+      transaction.get(claimRef),
+      transaction.get(walletRef),
+    ]);
+    if (!promoSnapshot.exists || promoSnapshot.data()?.active !== true) {
+      const error = new Error('Promo code is invalid or inactive.');
+      error.statusCode = 404;
+      throw error;
+    }
+    if (claimSnapshot.exists) {
+      const error = new Error('You have already used this promo code.');
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const promo = promoSnapshot.data();
+    const coins = Number(promo.coins || 0);
+    const usedCount = Number(promo.usedCount || 0);
+    const maxUses = Number(promo.maxUses || 0);
+    const now = Date.now();
+    const startsAt = promo.startsAt?.toMillis?.() ?? 0;
+    const endsAt = promo.endsAt?.toMillis?.() ?? 0;
+    if (
+      !Number.isInteger(coins) ||
+      coins < 1 ||
+      coins > 10 ||
+      !Number.isInteger(maxUses) ||
+      maxUses < 1 ||
+      usedCount >= maxUses ||
+      (startsAt > 0 && now < startsAt) ||
+      (endsAt > 0 && now > endsAt)
+    ) {
+      const error = new Error('Promo code has expired or reached its limit.');
+      error.statusCode = 410;
+      throw error;
+    }
+
+    const currentBalance = Number(walletSnapshot.data()?.coins || 0);
+    const nextBalance = currentBalance + coins;
+    const createdAt = FieldValue.serverTimestamp();
+    transaction.update(promoRef, {
+      usedCount: usedCount + 1,
+      updatedAt: createdAt,
+    });
+    transaction.create(claimRef, {
+      userId: uid,
+      code: normalizedCode,
+      coins,
+      createdAt,
+    });
+    transaction.set(
+      walletRef,
+      {
+        coins: nextBalance,
+        updatedAt: createdAt,
+      },
+      { merge: true },
+    );
+    transaction.create(transactionRef, {
+      userId: uid,
+      type: 'promo_bonus',
+      code: normalizedCode,
+      coins,
+      balanceAfter: nextBalance,
+      createdAt,
+    });
+    return { coins, balance: nextBalance };
+  });
+}
+
 async function verifyAppCheck(request, response, next) {
   const token = request.get('X-Firebase-AppCheck');
   if (!token) {
@@ -1110,6 +1206,41 @@ app.post(
       return response.status(error.statusCode || 400).json({
         success: false,
         message: error.message || 'Unable to use this referral code.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/rewards/promo/redeem',
+  dailyBonusIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, ['code'])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+    try {
+      const result = await redeemPromoCode(
+        request.firebaseUser.uid,
+        request.body.code,
+        request.firebaseUser,
+      );
+      return response.json({
+        success: true,
+        ...result,
+        message: `Promo applied: +${result.coins} coin${
+          result.coins === 1 ? '' : 's'
+        }.`,
+      });
+    } catch (error) {
+      console.warn('Promo redeem rejected:', error.message);
+      return response.status(error.statusCode || 400).json({
+        success: false,
+        message: error.message || 'Unable to use this promo code.',
       });
     }
   },

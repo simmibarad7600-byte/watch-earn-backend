@@ -28,6 +28,12 @@ const ADMOB_REWARDED_AD_UNIT_ID = String(
 const ADMOB_REWARD_AMOUNT = Number(process.env.ADMOB_REWARD_AMOUNT || 1);
 const COINS_PER_REWARD = Number(process.env.COINS_PER_REWARD || 1);
 const DAILY_REWARD_LIMIT = Number(process.env.DAILY_REWARD_LIMIT || 15);
+const REFERRAL_QUALIFYING_ADS = Number(
+  process.env.REFERRAL_QUALIFYING_ADS || 5,
+);
+const REFERRAL_REWARD_COINS = Number(
+  process.env.REFERRAL_REWARD_COINS || 1,
+);
 const ADMOB_KEYS_URL =
   'https://www.gstatic.com/admob/reward/verifier-keys.json';
 
@@ -290,6 +296,19 @@ function nextDailyStreak(lastClaimDay, currentStreak, today) {
     : 1;
 }
 
+function referralCodeForUid(uid) {
+  return crypto
+    .createHash('sha256')
+    .update(`watch-earn-referral-v1:${uid}`)
+    .digest('hex')
+    .slice(0, 10)
+    .toUpperCase();
+}
+
+function validRewardCode(value) {
+  return /^[A-Z0-9]{6,20}$/.test(String(value || '').trim().toUpperCase());
+}
+
 function normalizeAdMobTimestamp(value) {
   let timestamp = Number(value);
   if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
@@ -439,6 +458,8 @@ async function grantVerifiedAdReward(callback) {
 
     const currentCoins = Number(wallet.coins || 0);
     const nextCoins = currentCoins + COINS_PER_REWARD;
+    const lifetimeVerifiedAds =
+      Number(wallet.lifetimeVerifiedAds || 0) + 1;
     transaction.set(
       walletRef,
       {
@@ -446,6 +467,7 @@ async function grantVerifiedAdReward(callback) {
         coins: nextCoins,
         dailyRewardDate: today,
         dailyRewardCount: previousCount + 1,
+        lifetimeVerifiedAds,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
@@ -468,7 +490,184 @@ async function grantVerifiedAdReward(callback) {
       adTransactionId: transactionId,
       createdAt: FieldValue.serverTimestamp(),
     });
-    return { duplicate: false, credited: true, coins: COINS_PER_REWARD };
+    return {
+      duplicate: false,
+      credited: true,
+      coins: COINS_PER_REWARD,
+      lifetimeVerifiedAds,
+    };
+  });
+}
+
+async function ensureReferralCode(uid) {
+  const code = referralCodeForUid(uid);
+  const codeRef = firestore.collection('referralCodes').doc(code);
+  const userRef = firestore.collection('users').doc(uid);
+
+  await firestore.runTransaction(async (transaction) => {
+    const codeSnapshot = await transaction.get(codeRef);
+    if (codeSnapshot.exists && codeSnapshot.data()?.ownerUid !== uid) {
+      throw new Error('Referral code collision.');
+    }
+    transaction.set(
+      codeRef,
+      {
+        ownerUid: uid,
+        active: true,
+        createdAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    transaction.set(userRef, { referralCode: code }, { merge: true });
+  });
+  return code;
+}
+
+async function redeemReferralCode(uid, code, firebaseUser) {
+  if (!validRewardCode(code)) {
+    const error = new Error('Invalid referral code.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!firebaseUser.email_verified && !firebaseUser.phone_number) {
+    const error = new Error(
+      'Verify your email or phone before using a referral code.',
+    );
+    error.statusCode = 403;
+    throw error;
+  }
+
+  const normalizedCode = String(code).trim().toUpperCase();
+  const codeRef = firestore.collection('referralCodes').doc(normalizedCode);
+  const referralRef = firestore.collection('referrals').doc(uid);
+  const userRef = firestore.collection('users').doc(uid);
+
+  return firestore.runTransaction(async (transaction) => {
+    const [codeSnapshot, referralSnapshot] = await Promise.all([
+      transaction.get(codeRef),
+      transaction.get(referralRef),
+    ]);
+    if (!codeSnapshot.exists || codeSnapshot.data()?.active !== true) {
+      const error = new Error('Referral code was not found.');
+      error.statusCode = 404;
+      throw error;
+    }
+    if (referralSnapshot.exists) {
+      const error = new Error('A referral code is already linked.');
+      error.statusCode = 409;
+      throw error;
+    }
+
+    const inviterUid = codeSnapshot.data().ownerUid;
+    if (!validFirebaseUid(inviterUid) || inviterUid === uid) {
+      const error = new Error('You cannot use your own referral code.');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    transaction.create(referralRef, {
+      inviterUid,
+      referredUid: uid,
+      code: normalizedCode,
+      status: 'pending',
+      qualifyingAds: REFERRAL_QUALIFYING_ADS,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    transaction.set(
+      userRef,
+      {
+        referredByUid: inviterUid,
+        referralStatus: 'pending',
+      },
+      { merge: true },
+    );
+    return { status: 'pending', qualifyingAds: REFERRAL_QUALIFYING_ADS };
+  });
+}
+
+async function finalizeQualifiedReferral(referredUid) {
+  const referralRef = firestore.collection('referrals').doc(referredUid);
+  const referredWalletRef = firestore.collection('wallets').doc(referredUid);
+
+  return firestore.runTransaction(async (transaction) => {
+    const [referralSnapshot, referredWalletSnapshot] = await Promise.all([
+      transaction.get(referralRef),
+      transaction.get(referredWalletRef),
+    ]);
+    if (
+      !referralSnapshot.exists ||
+      referralSnapshot.data()?.status !== 'pending'
+    ) {
+      return { qualified: false };
+    }
+
+    const referredWallet = referredWalletSnapshot.data() || {};
+    if (
+      Number(referredWallet.lifetimeVerifiedAds || 0) <
+      REFERRAL_QUALIFYING_ADS
+    ) {
+      return { qualified: false };
+    }
+
+    const inviterUid = referralSnapshot.data().inviterUid;
+    if (!validFirebaseUid(inviterUid) || inviterUid === referredUid) {
+      throw new Error('Referral owner is invalid.');
+    }
+    const inviterWalletRef = firestore.collection('wallets').doc(inviterUid);
+    const inviterWalletSnapshot = await transaction.get(inviterWalletRef);
+    const inviterBalance = Number(inviterWalletSnapshot.data()?.coins || 0);
+    const referredBalance = Number(referredWallet.coins || 0);
+    const completedAt = FieldValue.serverTimestamp();
+
+    transaction.set(
+      inviterWalletRef,
+      {
+        coins: inviterBalance + REFERRAL_REWARD_COINS,
+        updatedAt: completedAt,
+      },
+      { merge: true },
+    );
+    transaction.set(
+      referredWalletRef,
+      {
+        coins: referredBalance + REFERRAL_REWARD_COINS,
+        updatedAt: completedAt,
+      },
+      { merge: true },
+    );
+    transaction.update(referralRef, {
+      status: 'qualified',
+      rewardCoins: REFERRAL_REWARD_COINS,
+      qualifiedAt: completedAt,
+    });
+    transaction.set(
+      firestore.collection('users').doc(referredUid),
+      { referralStatus: 'qualified' },
+      { merge: true },
+    );
+    transaction.create(
+      firestore.collection('transactions').doc(`referral_inviter_${referredUid}`),
+      {
+        userId: inviterUid,
+        type: 'referral_bonus',
+        coins: REFERRAL_REWARD_COINS,
+        balanceAfter: inviterBalance + REFERRAL_REWARD_COINS,
+        referredUid,
+        createdAt: completedAt,
+      },
+    );
+    transaction.create(
+      firestore.collection('transactions').doc(`referral_join_${referredUid}`),
+      {
+        userId: referredUid,
+        type: 'referral_bonus',
+        coins: REFERRAL_REWARD_COINS,
+        balanceAfter: referredBalance + REFERRAL_REWARD_COINS,
+        inviterUid,
+        createdAt: completedAt,
+      },
+    );
+    return { qualified: true, coins: REFERRAL_REWARD_COINS };
   });
 }
 
@@ -843,6 +1042,79 @@ app.post(
   },
 );
 
+app.post(
+  '/rewards/referral/status',
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, [])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+    try {
+      const uid = request.firebaseUser.uid;
+      const code = await ensureReferralCode(uid);
+      const [referralSnapshot, walletSnapshot] = await Promise.all([
+        firestore.collection('referrals').doc(uid).get(),
+        firestore.collection('wallets').doc(uid).get(),
+      ]);
+      return response.json({
+        success: true,
+        code,
+        referralStatus: referralSnapshot.data()?.status || 'not_linked',
+        verifiedAds: Number(
+          walletSnapshot.data()?.lifetimeVerifiedAds || 0,
+        ),
+        qualifyingAds: REFERRAL_QUALIFYING_ADS,
+        rewardCoins: REFERRAL_REWARD_COINS,
+      });
+    } catch (error) {
+      console.error('Referral status failed:', error.message);
+      return response.status(500).json({
+        success: false,
+        message: 'Referral details are temporarily unavailable.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/rewards/referral/redeem',
+  dailyBonusIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, ['code'])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+    try {
+      const result = await redeemReferralCode(
+        request.firebaseUser.uid,
+        request.body.code,
+        request.firebaseUser,
+      );
+      return response.json({
+        success: true,
+        ...result,
+        message:
+          `Referral linked. Complete ${result.qualifyingAds} verified ads ` +
+          'to unlock the reward.',
+      });
+    } catch (error) {
+      console.warn('Referral redeem rejected:', error.message);
+      return response.status(error.statusCode || 400).json({
+        success: false,
+        message: error.message || 'Unable to use this referral code.',
+      });
+    }
+  },
+);
+
 app.get('/admob/reward', async (request, response) => {
   try {
     const callback = await verifyAdMobCallback(request.originalUrl);
@@ -854,11 +1126,13 @@ app.get('/admob/reward', async (request, response) => {
       return response.status(200).send('OK');
     }
     const result = await grantVerifiedAdReward(callback);
+    const referralResult = await finalizeQualifiedReferral(callback.uid);
     console.info('Verified AdMob reward callback processed:', {
       transactionId: callback.transactionId,
       credited: result.credited,
       duplicate: result.duplicate,
       limited: result.limited || false,
+      referralQualified: referralResult.qualified,
     });
     return response.status(200).send('OK');
   } catch (error) {
@@ -902,7 +1176,9 @@ module.exports = {
   app,
   nextDailyStreak,
   previousUtcDay,
+  referralCodeForUid,
   utcDay,
+  validRewardCode,
   validIndianMobile,
   validOtp,
   validFirebaseUid,

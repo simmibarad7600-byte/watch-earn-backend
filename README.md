@@ -18,12 +18,14 @@ The AdMob rewarded ad unit callback URL is:
 
 ## Safety model
 
-- The app receives no authority to add coins.
+- The app receives no authority to add in-app points.
 - AdMob callbacks are verified with Google's rotating ECDSA public keys.
 - Each AdMob transaction can be used only once.
 - A user can receive at most `DAILY_REWARD_LIMIT` verified rewards per UTC day.
-- Wallet, transaction, claim, and withdrawal writes are server-only.
-- Withdrawals stay disabled until payout rules and fraud review are completed.
+- Point balance, transaction, and claim writes are server-only.
+- Points are non-transferable, usable only inside the app, and have no cash
+  value. Cash, gift-card, cryptocurrency, and withdrawal rewards are not
+  supported.
 
 ## Checks
 

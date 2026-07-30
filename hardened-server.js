@@ -27,7 +27,7 @@ const ADMOB_REWARDED_AD_UNIT_ID = String(
 ).trim();
 const ADMOB_REWARD_AMOUNT = Number(process.env.ADMOB_REWARD_AMOUNT || 1);
 const COINS_PER_REWARD = Number(process.env.COINS_PER_REWARD || 1);
-const DAILY_REWARD_LIMIT = Number(process.env.DAILY_REWARD_LIMIT || 15);
+const DAILY_REWARD_LIMIT = Number(process.env.DAILY_REWARD_LIMIT || 5);
 const REFERRAL_QUALIFYING_ADS = Number(
   process.env.REFERRAL_QUALIFYING_ADS || 5,
 );
@@ -933,6 +933,41 @@ async function verifyFirebaseUser(request, response, next) {
   }
 }
 
+async function deleteUserAccount(uid) {
+  const querySpecs = [
+    ['dailyClaims', 'userId'],
+    ['offerClaims', 'userId'],
+    ['promoClaims', 'userId'],
+    ['rewardClaims', 'userId'],
+    ['transactions', 'userId'],
+    ['referralCodes', 'ownerUid'],
+    ['referrals', 'inviterUid'],
+  ];
+  const snapshots = await Promise.all(
+    querySpecs.map(([collection, field]) =>
+      firestore.collection(collection).where(field, '==', uid).get(),
+    ),
+  );
+  const writer = firestore.bulkWriter();
+  const refs = new Map();
+  for (const ref of [
+    firestore.collection('users').doc(uid),
+    firestore.collection('wallets').doc(uid),
+    firestore.collection('referrals').doc(uid),
+  ]) {
+    refs.set(ref.path, ref);
+  }
+  for (const snapshot of snapshots) {
+    for (const document of snapshot.docs) {
+      refs.set(document.ref.path, document.ref);
+    }
+  }
+  for (const ref of refs.values()) writer.delete(ref);
+  await writer.close();
+  await firebaseAuth.deleteUser(uid);
+  return { deletedRecords: refs.size };
+}
+
 async function grantDailyBonus(uid) {
   const today = utcDay();
   const claimId = `${uid}_${today}`;
@@ -1081,6 +1116,41 @@ app.get('/health', (_request, response) => {
     appCheckEnforced: ENFORCE_APP_CHECK,
   });
 });
+
+app.post(
+  '/account/delete',
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, ['confirmation'])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+    if (request.body.confirmation !== 'DELETE') {
+      return response.status(400).json({
+        success: false,
+        message: 'Account deletion was not confirmed.',
+      });
+    }
+    try {
+      const result = await deleteUserAccount(request.firebaseUser.uid);
+      return response.json({
+        success: true,
+        ...result,
+        message: 'Your account and associated app data were deleted.',
+      });
+    } catch (error) {
+      console.error('Account deletion failed:', error.message);
+      return response.status(500).json({
+        success: false,
+        message:
+          'Account deletion is temporarily unavailable. Please try again.',
+      });
+    }
+  },
+);
 
 app.post(
   '/otp/send',

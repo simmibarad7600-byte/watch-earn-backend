@@ -1,18 +1,18 @@
 # Watch & Earn security policy
 
-## Money protection
+## In-app points protection
 
-- The app never writes balances, rewards, transactions, or withdrawals.
+- The app never writes point balances, rewards, or transactions.
 - Rewards stay disabled until the chosen ad network sends signed
   server-to-server proof.
 - Provider transaction IDs must be unique and credited atomically.
-- The server will enforce per-event, per-day, and platform payout caps.
-- Withdrawals are server-created and high-risk accounts require review.
+- The server enforces per-event and per-day reward caps.
+- Points are non-transferable, usable only inside the app, and have no cash
+  value.
 - Balance changes use an append-only ledger, not a client-supplied amount.
 
-Before rewards go live, choose the coin value, maximum rewarded events per day,
-maximum daily coins, minimum withdrawal, cooling period, and maximum total
-daily payout budget.
+Before rewards go live, choose the in-app point value, maximum rewarded events
+per day, maximum daily points, and the point thresholds for in-app benefits.
 
 ## Current controls
 
@@ -24,7 +24,6 @@ daily payout budget.
 - Secrets stay in Railway variables and never in the Flutter app.
 - Ad rewards are credited only after verifying AdMob's ECDSA signature.
   Transaction IDs are single-use and rewards have a per-user daily limit.
-- The client cannot write wallet balances, reward claims, or transactions.
-- Do not treat coins as cash until a separate, reviewed withdrawal service is
-  implemented with identity checks, minimum payout, fraud review, and a
-  server-side exchange rate.
+- The client cannot write point balances, reward claims, or transactions.
+- Never convert points into cash, gift cards, cryptocurrency, or transferable
+  items.

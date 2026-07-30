@@ -19,10 +19,16 @@ process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 = Buffer.from(
 ).toString('base64');
 
 const {
+  nextDailyStreak,
+  bitLabsSignature,
   normalizeAdMobTimestamp,
+  referralCodeForUid,
+  stripBitLabsHash,
   validFirebaseUid,
   validIndianMobile,
   validOtp,
+  validRewardCode,
+  verifyBitLabsCallback,
   verifyEcdsaSignature,
 } = require('./hardened-server');
 
@@ -72,5 +78,24 @@ test('verifies an ECDSA signed callback payload without modifying it', () => {
       signature,
     ),
     false,
+  );
+});
+
+test('verifies BitLabs HMAC callback and rejects tampering', () => {
+  const secret = 'bitlabs-test-secret';
+  const unsigned =
+    'https://example.com/bitlabs/reward?uid=phone_917600140353&' +
+    'val=3&raw=0.12&tx=offer_tx_123';
+  const signed = `${unsigned}&hash=${bitLabsSignature(unsigned, secret)}`;
+  assert.equal(stripBitLabsHash(signed), unsigned);
+  assert.deepEqual(verifyBitLabsCallback(signed, secret), {
+    uid: 'phone_917600140353',
+    transactionId: 'offer_tx_123',
+    coins: 3,
+    usdValue: 0.12,
+  });
+  assert.throws(
+    () => verifyBitLabsCallback(signed.replace('val=3', 'val=30'), secret),
+    /signature/,
   );
 });

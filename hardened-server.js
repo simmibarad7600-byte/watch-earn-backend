@@ -96,6 +96,17 @@ const BITLABS_APP_SECRET = String(process.env.BITLABS_APP_SECRET || '').trim();
 const BITLABS_MAX_COINS_PER_CALLBACK = Number(
   process.env.BITLABS_MAX_COINS_PER_CALLBACK || 100,
 );
+const AYET_ENABLED =
+  String(process.env.AYET_ENABLED || 'false').toLowerCase() === 'true';
+const AYET_API_KEY = String(process.env.AYET_API_KEY || '').trim();
+const AYET_PLACEMENT_IDENTIFIER = String(
+  process.env.AYET_PLACEMENT_IDENTIFIER || '',
+).trim();
+const AYET_USER_SHARE_BPS = Number(process.env.AYET_USER_SHARE_BPS || 0);
+const AYET_MAX_PAYOUT_USD_MICROS = Number(
+  process.env.AYET_MAX_PAYOUT_USD_MICROS || 100_000_000,
+);
+const AYET_HOLD_DAYS = Number(process.env.AYET_HOLD_DAYS || 30);
 const ADMOB_KEYS_URL =
   'https://www.gstatic.com/admob/reward/verifier-keys.json';
 
@@ -112,6 +123,30 @@ function ensureConfiguration() {
   if (!FAST2SMS_API_KEY) missing.push('FAST2SMS_API_KEY');
   if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
     missing.push('FIREBASE_SERVICE_ACCOUNT_BASE64');
+  }
+  if (AYET_ENABLED && !AYET_API_KEY) missing.push('AYET_API_KEY');
+  if (
+    AYET_ENABLED &&
+    (!Number.isInteger(AYET_USER_SHARE_BPS) ||
+      AYET_USER_SHARE_BPS < 1 ||
+      AYET_USER_SHARE_BPS > 9000)
+  ) {
+    missing.push('AYET_USER_SHARE_BPS (integer from 1 to 9000)');
+  }
+  if (
+    AYET_ENABLED &&
+    (!Number.isSafeInteger(AYET_MAX_PAYOUT_USD_MICROS) ||
+      AYET_MAX_PAYOUT_USD_MICROS < 1)
+  ) {
+    missing.push('AYET_MAX_PAYOUT_USD_MICROS (positive integer)');
+  }
+  if (
+    AYET_ENABLED &&
+    (!Number.isInteger(AYET_HOLD_DAYS) ||
+      AYET_HOLD_DAYS < 1 ||
+      AYET_HOLD_DAYS > 90)
+  ) {
+    missing.push('AYET_HOLD_DAYS (integer from 1 to 90)');
   }
   if (missing.length > 0) {
     throw new Error(`Missing required environment values: ${missing.join(', ')}`);
@@ -410,6 +445,115 @@ function safeHexEqual(expected, supplied) {
   const left = Buffer.from(String(expected || '').toLowerCase(), 'utf8');
   const right = Buffer.from(String(supplied || '').toLowerCase(), 'utf8');
   return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function decimalUsdToMicros(value) {
+  const normalized = String(value ?? '').trim();
+  const match = normalized.match(/^(-?)(0|[1-9][0-9]{0,5})(?:\.([0-9]{1,6}))?$/);
+  if (!match) throw new Error('Invalid USD payout value.');
+  const fraction = String(match[3] || '').padEnd(6, '0');
+  const micros =
+    BigInt(match[2]) * 1_000_000n + BigInt(fraction || '0');
+  const signedMicros = match[1] === '-' ? -micros : micros;
+  if (
+    signedMicros > BigInt(Number.MAX_SAFE_INTEGER) ||
+    signedMicros < BigInt(Number.MIN_SAFE_INTEGER)
+  ) {
+    throw new Error('USD payout value is out of range.');
+  }
+  return Number(signedMicros);
+}
+
+function ayetSortedQuery(fullUrl) {
+  const parsed = new URL(String(fullUrl || ''), 'https://callback.invalid');
+  return new URLSearchParams(
+    [...parsed.searchParams.entries()].sort(([left], [right]) =>
+      left.localeCompare(right),
+    ),
+  ).toString();
+}
+
+function ayetSignature(fullUrl, secret) {
+  return crypto
+    .createHmac('sha256', String(secret || ''))
+    .update(ayetSortedQuery(fullUrl), 'utf8')
+    .digest('hex');
+}
+
+function calculateAyetUserReward(payoutUsdMicros, shareBps) {
+  if (
+    !Number.isSafeInteger(payoutUsdMicros) ||
+    payoutUsdMicros < 0 ||
+    !Number.isSafeInteger(shareBps) ||
+    shareBps < 1 ||
+    shareBps > 9000
+  ) {
+    throw new Error('ayeT reward share configuration is invalid.');
+  }
+  return Number((BigInt(payoutUsdMicros) * BigInt(shareBps)) / 10_000n);
+}
+
+function verifyAyetCallback(fullUrl, suppliedHash, secret, shareBps) {
+  if (!secret) throw new Error('ayeT API key is not configured.');
+  if (!/^[a-f0-9]{64}$/i.test(String(suppliedHash || ''))) {
+    throw new Error('Malformed ayeT callback hash.');
+  }
+  const expectedHash = ayetSignature(fullUrl, secret);
+  if (!safeHexEqual(expectedHash, suppliedHash)) {
+    throw new Error('Invalid ayeT callback signature.');
+  }
+
+  const parsed = new URL(String(fullUrl || ''), 'https://callback.invalid');
+  const transactionId = parsed.searchParams.get('transaction_id');
+  const uid = parsed.searchParams.get('external_identifier');
+  const placementIdentifier = parsed.searchParams.get('placement_identifier');
+  const chargebackFlag = parsed.searchParams.get('is_chargeback') || '0';
+  const sandboxFlag = parsed.searchParams.get('is_sandbox') || '0';
+  const isChargeback = chargebackFlag === '1';
+  const isSandbox = sandboxFlag === '1';
+  const payoutUsdMicros = decimalUsdToMicros(
+    parsed.searchParams.get('payout_usd'),
+  );
+  const absolutePayoutUsdMicros = Math.abs(payoutUsdMicros);
+
+  if (
+    !validFirebaseUid(uid) ||
+    !/^(?:r-)?[A-Za-z0-9:_-]{1,160}$/.test(String(transactionId || '')) ||
+    !['0', '1'].includes(chargebackFlag) ||
+    !['0', '1'].includes(sandboxFlag) ||
+    (isChargeback && !String(transactionId).startsWith('r-')) ||
+    (!isChargeback && String(transactionId).startsWith('r-')) ||
+    (isChargeback && payoutUsdMicros >= 0) ||
+    (!isChargeback && payoutUsdMicros < 0) ||
+    (!isSandbox && absolutePayoutUsdMicros < 1) ||
+    absolutePayoutUsdMicros > AYET_MAX_PAYOUT_USD_MICROS
+  ) {
+    throw new Error('ayeT callback values failed validation.');
+  }
+  if (
+    AYET_PLACEMENT_IDENTIFIER &&
+    placementIdentifier !== AYET_PLACEMENT_IDENTIFIER
+  ) {
+    throw new Error('ayeT placement identifier is invalid.');
+  }
+
+  const originalTransactionId = isChargeback
+    ? String(transactionId).slice(2)
+    : String(transactionId);
+  const userRewardUsdMicros = calculateAyetUserReward(
+    absolutePayoutUsdMicros,
+    shareBps,
+  );
+  return {
+    uid,
+    transactionId: String(transactionId),
+    originalTransactionId,
+    placementIdentifier: placementIdentifier || '',
+    payoutUsdMicros,
+    userRewardUsdMicros,
+    isChargeback,
+    isSandbox,
+  };
 }
 
 function verifyBitLabsCallback(fullUrl, secret) {
@@ -1111,6 +1255,235 @@ async function grantDailyBonus(uid) {
       streak,
       coins: rewardCoins,
       balance: nextBalance,
+    };
+  });
+}
+
+async function grantAyetCashReward(callback) {
+  const {
+    uid,
+    transactionId,
+    originalTransactionId,
+    placementIdentifier,
+    payoutUsdMicros,
+    userRewardUsdMicros,
+    isChargeback,
+    isSandbox,
+  } = callback;
+
+  // ayeT sandbox callbacks verify the integration only. They must never
+  // modify a real user's wallet or create a claim that blocks production.
+  if (isSandbox) {
+    return {
+      duplicate: false,
+      credited: false,
+      reversed: false,
+      sandbox: true,
+    };
+  }
+
+  if (!isChargeback) {
+    const authUser = await firebaseAuth.getUser(uid);
+    const verifiedAccount =
+      authUser.emailVerified === true ||
+      Boolean(authUser.phoneNumber) ||
+      authUser.customClaims?.phone_verified === true;
+    if (!verifiedAccount) throw new Error('Offer user is not verified.');
+  }
+
+  const claimRef = firestore
+    .collection('cashClaims')
+    .doc(`ayet_${transactionId}`);
+  const originalClaimRef = firestore
+    .collection('cashClaims')
+    .doc(`ayet_${originalTransactionId}`);
+  const walletRef = firestore.collection('cashWallets').doc(uid);
+  const userRef = firestore.collection('users').doc(uid);
+  const transactionRef = firestore
+    .collection('cashTransactions')
+    .doc(`ayet_${transactionId}`);
+
+  return firestore.runTransaction(async (transaction) => {
+    if (!isChargeback) {
+      const [claimSnapshot, userSnapshot, walletSnapshot] = await Promise.all([
+        transaction.get(claimRef),
+        transaction.get(userRef),
+        transaction.get(walletRef),
+      ]);
+      if (claimSnapshot.exists) {
+        return { duplicate: true, credited: false, reversed: false };
+      }
+      if (!userSnapshot.exists) throw new Error('Offer user does not exist.');
+
+      const wallet = walletSnapshot.data() || {};
+      const pendingUsdMicros = Number(wallet.pendingUsdMicros || 0);
+      const lifetimeEarnedUsdMicros = Number(
+        wallet.lifetimeEarnedUsdMicros || 0,
+      );
+      if (
+        !Number.isSafeInteger(pendingUsdMicros) ||
+        pendingUsdMicros < 0 ||
+        !Number.isSafeInteger(lifetimeEarnedUsdMicros) ||
+        lifetimeEarnedUsdMicros < 0
+      ) {
+        throw new Error('Cash wallet values are invalid.');
+      }
+      const nextPendingUsdMicros = pendingUsdMicros + userRewardUsdMicros;
+      const nextLifetimeEarnedUsdMicros =
+        lifetimeEarnedUsdMicros + userRewardUsdMicros;
+      if (
+        !Number.isSafeInteger(nextPendingUsdMicros) ||
+        !Number.isSafeInteger(nextLifetimeEarnedUsdMicros)
+      ) {
+        throw new Error('Cash wallet value is out of range.');
+      }
+      const availableAt = new Date(
+        Date.now() + AYET_HOLD_DAYS * 24 * 60 * 60 * 1000,
+      );
+
+      transaction.set(
+        walletRef,
+        {
+          uid,
+          currency: 'USD',
+          pendingUsdMicros: nextPendingUsdMicros,
+          lifetimeEarnedUsdMicros: nextLifetimeEarnedUsdMicros,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+      transaction.create(claimRef, {
+        provider: 'ayet',
+        userId: uid,
+        providerTransactionId: transactionId,
+        placementIdentifier,
+        providerPayoutUsdMicros: payoutUsdMicros,
+        userRewardUsdMicros,
+        status: 'pending',
+        availableAt,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      transaction.create(transactionRef, {
+        userId: uid,
+        type: 'verified_offer_cash_reward',
+        provider: 'ayet',
+        currency: 'USD',
+        amountUsdMicros: userRewardUsdMicros,
+        pendingBalanceAfterUsdMicros: nextPendingUsdMicros,
+        providerTransactionId: transactionId,
+        providerPayoutUsdMicros: payoutUsdMicros,
+        availableAt,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      return {
+        duplicate: false,
+        credited: true,
+        reversed: false,
+        userRewardUsdMicros,
+      };
+    }
+
+    const [reversalSnapshot, originalSnapshot, walletSnapshot] =
+      await Promise.all([
+        transaction.get(claimRef),
+        transaction.get(originalClaimRef),
+        transaction.get(walletRef),
+      ]);
+    if (reversalSnapshot.exists) {
+      return { duplicate: true, credited: false, reversed: false };
+    }
+    if (!originalSnapshot.exists) {
+      throw new Error('Original ayeT cash claim was not found.');
+    }
+    const originalClaim = originalSnapshot.data() || {};
+    if (
+      originalClaim.provider !== 'ayet' ||
+      originalClaim.userId !== uid ||
+      originalClaim.status === 'reversed'
+    ) {
+      throw new Error('Original ayeT cash claim cannot be reversed.');
+    }
+    const reversalUsdMicros = Number(originalClaim.userRewardUsdMicros || 0);
+    if (!Number.isSafeInteger(reversalUsdMicros) || reversalUsdMicros < 0) {
+      throw new Error('Original ayeT reward value is invalid.');
+    }
+
+    const wallet = walletSnapshot.data() || {};
+    const pendingUsdMicros = Number(wallet.pendingUsdMicros || 0);
+    const availableUsdMicros = Number(wallet.availableUsdMicros || 0);
+    const debtUsdMicros = Number(wallet.debtUsdMicros || 0);
+    const lifetimeReversedUsdMicros = Number(
+      wallet.lifetimeReversedUsdMicros || 0,
+    );
+    if (
+      ![pendingUsdMicros, availableUsdMicros, debtUsdMicros,
+        lifetimeReversedUsdMicros].every(
+        (value) => Number.isSafeInteger(value) && value >= 0,
+      )
+    ) {
+      throw new Error('Cash wallet values are invalid.');
+    }
+
+    const pendingDeduction = Math.min(pendingUsdMicros, reversalUsdMicros);
+    const afterPending = reversalUsdMicros - pendingDeduction;
+    const availableDeduction = Math.min(availableUsdMicros, afterPending);
+    const debtAddedUsdMicros = afterPending - availableDeduction;
+    const nextDebtUsdMicros = debtUsdMicros + debtAddedUsdMicros;
+    const nextLifetimeReversedUsdMicros =
+      lifetimeReversedUsdMicros + reversalUsdMicros;
+    if (
+      !Number.isSafeInteger(nextDebtUsdMicros) ||
+      !Number.isSafeInteger(nextLifetimeReversedUsdMicros)
+    ) {
+      throw new Error('Cash wallet value is out of range.');
+    }
+
+    transaction.set(
+      walletRef,
+      {
+        uid,
+        currency: 'USD',
+        pendingUsdMicros: pendingUsdMicros - pendingDeduction,
+        availableUsdMicros: availableUsdMicros - availableDeduction,
+        debtUsdMicros: nextDebtUsdMicros,
+        lifetimeReversedUsdMicros: nextLifetimeReversedUsdMicros,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    transaction.update(originalClaimRef, {
+      status: 'reversed',
+      reversalTransactionId: transactionId,
+      reversedAt: FieldValue.serverTimestamp(),
+    });
+    transaction.create(claimRef, {
+      provider: 'ayet',
+      userId: uid,
+      providerTransactionId: transactionId,
+      originalTransactionId,
+      placementIdentifier,
+      providerPayoutUsdMicros: payoutUsdMicros,
+      userRewardUsdMicros: -reversalUsdMicros,
+      status: 'reversal_applied',
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    transaction.create(transactionRef, {
+      userId: uid,
+      type: 'verified_offer_cash_reversal',
+      provider: 'ayet',
+      currency: 'USD',
+      amountUsdMicros: -reversalUsdMicros,
+      providerTransactionId: transactionId,
+      originalTransactionId,
+      debtAddedUsdMicros,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    return {
+      duplicate: false,
+      credited: false,
+      reversed: true,
+      userRewardUsdMicros: reversalUsdMicros,
+      debtAddedUsdMicros,
     };
   });
 }
@@ -2253,6 +2626,32 @@ app.get('/bitlabs/reward', async (request, response) => {
   }
 });
 
+app.get('/ayet/reward', async (request, response) => {
+  if (!AYET_ENABLED) {
+    return response.status(503).send('Provider disabled');
+  }
+  try {
+    const callback = verifyAyetCallback(
+      request.originalUrl,
+      request.get('X-Ayetstudios-Security-Hash'),
+      AYET_API_KEY,
+      AYET_USER_SHARE_BPS,
+    );
+    const result = await grantAyetCashReward(callback);
+    console.info('Verified ayeT cash callback processed:', {
+      transactionId: callback.transactionId,
+      credited: result.credited,
+      reversed: result.reversed,
+      duplicate: result.duplicate,
+      sandbox: result.sandbox || false,
+    });
+    return response.status(200).send('OK');
+  } catch (error) {
+    console.warn('Rejected ayeT cash callback:', error.message);
+    return response.status(400).send('Invalid callback');
+  }
+});
+
 app.use((_request, response) => {
   response.status(404).json({ success: false, message: 'Route not found.' });
 });
@@ -2304,6 +2703,11 @@ module.exports = {
   isTestRewardUid,
   testRewardDocumentIds,
   utcWeekKey,
+  decimalUsdToMicros,
+  ayetSortedQuery,
+  ayetSignature,
+  calculateAyetUserReward,
+  verifyAyetCallback,
   bitLabsSignature,
   stripBitLabsHash,
   verifyBitLabsCallback,

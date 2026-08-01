@@ -20,8 +20,11 @@ process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 = Buffer.from(
 
 const {
   nextDailyStreak,
+  ayetSignature,
   bitLabsSignature,
+  calculateAyetUserReward,
   calculateMemoryScore,
+  decimalUsdToMicros,
   isTestRewardUid,
   normalizeAdMobTimestamp,
   missionClaimId,
@@ -36,6 +39,7 @@ const {
   validIndianMobile,
   validOtp,
   validRewardCode,
+  verifyAyetCallback,
   verifyBitLabsCallback,
   verifyEcdsaSignature,
   utcWeekKey,
@@ -153,4 +157,90 @@ test('verifies BitLabs HMAC callback and rejects tampering', () => {
     () => verifyBitLabsCallback(signed.replace('val=3', 'val=30'), secret),
     /signature/,
   );
+});
+
+test('converts USD decimals to integer micros without floating point', () => {
+  assert.equal(decimalUsdToMicros('0'), 0);
+  assert.equal(decimalUsdToMicros('0.36'), 360_000);
+  assert.equal(decimalUsdToMicros('12.345678'), 12_345_678);
+  assert.equal(decimalUsdToMicros('-0.36'), -360_000);
+  assert.throws(() => decimalUsdToMicros('0.1234567'), /Invalid USD/);
+  assert.throws(() => decimalUsdToMicros('1e2'), /Invalid USD/);
+});
+
+test('calculates bounded ayeT user revenue share in integer micros', () => {
+  assert.equal(calculateAyetUserReward(360_000, 5000), 180_000);
+  assert.equal(calculateAyetUserReward(1, 5000), 0);
+  assert.throws(
+    () => calculateAyetUserReward(360_000, 10000),
+    /configuration/,
+  );
+});
+
+test('verifies ayeT HMAC callbacks and rejects payout tampering', () => {
+  const secret = 'ayet-test-api-key';
+  const unsigned =
+    'https://example.com/ayet/reward?placement_identifier=placement_test&' +
+    'currency_amount=25.2&transaction_id=offer_tx_456&is_chargeback=0&' +
+    'payout_usd=0.36&external_identifier=phone_917600140353';
+  const signature = ayetSignature(unsigned, secret);
+  assert.deepEqual(verifyAyetCallback(unsigned, signature, secret, 5000), {
+    uid: 'phone_917600140353',
+    transactionId: 'offer_tx_456',
+    originalTransactionId: 'offer_tx_456',
+    placementIdentifier: 'placement_test',
+    payoutUsdMicros: 360_000,
+    userRewardUsdMicros: 180_000,
+    isChargeback: false,
+    isSandbox: false,
+  });
+  assert.throws(
+    () =>
+      verifyAyetCallback(
+        unsigned.replace('payout_usd=0.36', 'payout_usd=3.60'),
+        signature,
+        secret,
+        5000,
+      ),
+    /signature/,
+  );
+});
+
+test('verifies ayeT reversal and sandbox callbacks', () => {
+  const secret = 'ayet-test-api-key';
+  const reversal =
+    'https://example.com/ayet/reward?transaction_id=r-offer_tx_456&' +
+    'external_identifier=phone_917600140353&payout_usd=-0.36&' +
+    'placement_identifier=placement_test&is_chargeback=1';
+  assert.deepEqual(
+    verifyAyetCallback(
+      reversal,
+      ayetSignature(reversal, secret),
+      secret,
+      5000,
+    ),
+    {
+      uid: 'phone_917600140353',
+      transactionId: 'r-offer_tx_456',
+      originalTransactionId: 'offer_tx_456',
+      placementIdentifier: 'placement_test',
+      payoutUsdMicros: -360_000,
+      userRewardUsdMicros: 180_000,
+      isChargeback: true,
+      isSandbox: false,
+    },
+  );
+
+  const sandbox =
+    'https://example.com/ayet/reward?transaction_id=sandbox_tx_1&' +
+    'external_identifier=phone_917600140353&payout_usd=0&' +
+    'placement_identifier=placement_test&is_chargeback=0&is_sandbox=1';
+  const parsedSandbox = verifyAyetCallback(
+    sandbox,
+    ayetSignature(sandbox, secret),
+    secret,
+    5000,
+  );
+  assert.equal(parsedSandbox.isSandbox, true);
+  assert.equal(parsedSandbox.userRewardUsdMicros, 0);
 });

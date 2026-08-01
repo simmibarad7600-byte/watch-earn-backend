@@ -107,6 +107,11 @@ const AYET_MAX_PAYOUT_USD_MICROS = Number(
   process.env.AYET_MAX_PAYOUT_USD_MICROS || 100_000_000,
 );
 const AYET_HOLD_DAYS = Number(process.env.AYET_HOLD_DAYS || 30);
+const CASH_EARN_HUB_ENABLED =
+  String(process.env.CASH_EARN_HUB_ENABLED || 'false').toLowerCase() === 'true';
+const CASH_DAILY_GOAL_USD_MICROS = Number(
+  process.env.CASH_DAILY_GOAL_USD_MICROS || 1_000_000,
+);
 const ADMOB_KEYS_URL =
   'https://www.gstatic.com/admob/reward/verifier-keys.json';
 
@@ -147,6 +152,12 @@ function ensureConfiguration() {
       AYET_HOLD_DAYS > 90)
   ) {
     missing.push('AYET_HOLD_DAYS (integer from 1 to 90)');
+  }
+  if (
+    !Number.isSafeInteger(CASH_DAILY_GOAL_USD_MICROS) ||
+    CASH_DAILY_GOAL_USD_MICROS < 1
+  ) {
+    missing.push('CASH_DAILY_GOAL_USD_MICROS (positive integer)');
   }
   if (missing.length > 0) {
     throw new Error(`Missing required environment values: ${missing.join(', ')}`);
@@ -257,6 +268,17 @@ const dailyBonusIpLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many bonus requests. Please try again later.',
+  },
+});
+
+const cashSummaryIpLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many wallet refreshes. Please wait a moment.',
   },
 });
 
@@ -1163,6 +1185,8 @@ async function deleteUserAccount(uid) {
     ['missionClaims', 'userId'],
     ['gameSessions', 'userId'],
     ['transactions', 'userId'],
+    ['cashClaims', 'userId'],
+    ['cashTransactions', 'userId'],
     ['referralCodes', 'ownerUid'],
     ['referrals', 'inviterUid'],
   ];
@@ -1176,6 +1200,7 @@ async function deleteUserAccount(uid) {
   for (const ref of [
     firestore.collection('users').doc(uid),
     firestore.collection('wallets').doc(uid),
+    firestore.collection('cashWallets').doc(uid),
     firestore.collection('referrals').doc(uid),
     firestore.collection('testRewardBaselines').doc(uid),
   ]) {
@@ -1257,6 +1282,101 @@ async function grantDailyBonus(uid) {
       balance: nextBalance,
     };
   });
+}
+
+function safeCashAmount(value, fieldName) {
+  const amount = Number(value || 0);
+  if (!Number.isSafeInteger(amount) || amount < 0) {
+    throw new Error(`Invalid cash wallet field: ${fieldName}.`);
+  }
+  return amount;
+}
+
+function timestampIso(value) {
+  if (!value) return null;
+  if (typeof value.toDate === 'function') return value.toDate().toISOString();
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+async function cashSummaryForUser(uid) {
+  const [walletSnapshot, transactionSnapshot] = await Promise.all([
+    firestore.collection('cashWallets').doc(uid).get(),
+    firestore
+      .collection('cashTransactions')
+      .where('userId', '==', uid)
+      .limit(50)
+      .get(),
+  ]);
+  const wallet = walletSnapshot.data() || {};
+  const now = Date.now();
+  const today = utcDayKey(now);
+  const transactions = transactionSnapshot.docs
+    .map((document) => {
+      const data = document.data() || {};
+      const amountUsdMicros = Number(data.amountUsdMicros || 0);
+      if (!Number.isSafeInteger(amountUsdMicros)) {
+        throw new Error('Invalid cash transaction amount.');
+      }
+      const createdAt = timestampIso(data.createdAt);
+      const isReversal = data.type === 'verified_offer_cash_reversal';
+      return {
+        id: document.id,
+        type: String(data.type || 'verified_offer_cash_reward'),
+        provider: String(data.provider || 'provider'),
+        currency: String(data.currency || 'USD'),
+        amountUsdMicros,
+        status: isReversal ? 'reversed' : 'pending_verification',
+        createdAt,
+        availableAt: timestampIso(data.availableAt),
+      };
+    })
+    .sort((left, right) =>
+      String(right.createdAt || '').localeCompare(String(left.createdAt || '')),
+    );
+  const earnedTodayUsdMicros = transactions.reduce((sum, transaction) => {
+    if (
+      transaction.amountUsdMicros > 0 &&
+      transaction.createdAt?.startsWith(today)
+    ) {
+      return sum + transaction.amountUsdMicros;
+    }
+    return sum;
+  }, 0);
+  const offerwallAvailable = Boolean(
+    CASH_EARN_HUB_ENABLED && AYET_ENABLED && AYET_PLACEMENT_IDENTIFIER,
+  );
+
+  return {
+    providerStatus: offerwallAvailable ? 'available' : 'review_pending',
+    offerwallAvailable,
+    wallet: {
+      currency: String(wallet.currency || 'USD'),
+      pendingUsdMicros: safeCashAmount(
+        wallet.pendingUsdMicros,
+        'pendingUsdMicros',
+      ),
+      availableUsdMicros: safeCashAmount(
+        wallet.availableUsdMicros,
+        'availableUsdMicros',
+      ),
+      lifetimeEarnedUsdMicros: safeCashAmount(
+        wallet.lifetimeEarnedUsdMicros,
+        'lifetimeEarnedUsdMicros',
+      ),
+      lifetimeReversedUsdMicros: safeCashAmount(
+        wallet.lifetimeReversedUsdMicros,
+        'lifetimeReversedUsdMicros',
+      ),
+      debtUsdMicros: safeCashAmount(wallet.debtUsdMicros, 'debtUsdMicros'),
+    },
+    dailyGoal: {
+      earnedUsdMicros: earnedTodayUsdMicros,
+      targetUsdMicros: CASH_DAILY_GOAL_USD_MICROS,
+    },
+    payoutStatus: 'not_configured',
+    transactions,
+  };
 }
 
 async function grantAyetCashReward(callback) {
@@ -2126,6 +2246,31 @@ app.post(
         success: false,
         message:
           'Account deletion is temporarily unavailable. Please try again.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/cash/summary',
+  cashSummaryIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, [])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+    try {
+      const summary = await cashSummaryForUser(request.firebaseUser.uid);
+      return response.json({ success: true, ...summary });
+    } catch (error) {
+      console.error('Cash summary failed:', error.message);
+      return response.status(500).json({
+        success: false,
+        message: 'Cash wallet is temporarily unavailable.',
       });
     }
   },

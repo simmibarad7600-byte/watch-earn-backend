@@ -27,3 +27,16 @@ per day, maximum daily points, and the point thresholds for in-app benefits.
 - The client cannot write point balances, reward claims, or transactions.
 - Never convert points into cash, gift cards, cryptocurrency, or transferable
   items.
+
+## Separate verified cash rewards
+
+- Cash never comes from AdMob, games, XP, daily check-ins, promo codes, or the
+  in-app point balance.
+- Cash claims are created only after a supported survey/offer provider sends a
+  valid signed server callback.
+- Cash uses separate `cashWallets`, `cashClaims`, and `cashTransactions`
+  records with unique provider transaction IDs.
+- Provider reversals deduct pending/available balances and record debt when a
+  paid or available reward can no longer be recovered.
+- The cash earn hub remains disabled until written provider permission,
+  settlement rules, payout compliance, and staged anti-fraud tests are done.

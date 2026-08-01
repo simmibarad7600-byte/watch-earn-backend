@@ -22,6 +22,10 @@ const {
   nextDailyStreak,
   bitLabsSignature,
   normalizeAdMobTimestamp,
+  missionClaimId,
+  missionPeriod,
+  missionProgress,
+  missionTarget,
   referralCodeForUid,
   stripBitLabsHash,
   validFirebaseUid,
@@ -30,6 +34,7 @@ const {
   validRewardCode,
   verifyBitLabsCallback,
   verifyEcdsaSignature,
+  utcWeekKey,
 } = require('./hardened-server');
 
 test('validates Indian mobile and OTP formats', () => {
@@ -51,6 +56,26 @@ test('normalizes seconds, milliseconds, and microseconds', () => {
   assert.equal(
     normalizeAdMobTimestamp('1700000000000000'),
     1700000000000,
+  );
+});
+
+test('calculates daily and weekly mission progress on UTC periods', () => {
+  const now = Date.parse('2026-08-01T12:00:00Z');
+  const wallet = {
+    dailyBonusLastClaimDate: '2026-08-01',
+    dailyRewardDate: '2026-08-01',
+    dailyRewardCount: 3,
+    weeklyRewardWeek: utcWeekKey(now),
+    weeklyRewardCount: 7,
+  };
+  assert.equal(missionProgress(wallet, 'daily_check_in', now), 1);
+  assert.equal(missionProgress(wallet, 'daily_three_ads', now), 3);
+  assert.equal(missionProgress(wallet, 'weekly_ten_ads', now), 7);
+  assert.equal(missionTarget('weekly_ten_ads'), 10);
+  assert.equal(missionPeriod('daily_one_ad', now), '2026-08-01');
+  assert.match(
+    missionClaimId('user_12345678', 'daily_one_ad', now),
+    /user_12345678_daily_one_ad_2026-08-01/,
   );
 });
 

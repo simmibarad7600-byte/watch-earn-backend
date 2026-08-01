@@ -28,6 +28,12 @@ const ADMOB_REWARDED_AD_UNIT_ID = String(
 const ADMOB_REWARD_AMOUNT = Number(process.env.ADMOB_REWARD_AMOUNT || 1);
 const COINS_PER_REWARD = Number(process.env.COINS_PER_REWARD || 1);
 const DAILY_REWARD_LIMIT = Number(process.env.DAILY_REWARD_LIMIT || 5);
+const MISSION_REWARDS = Object.freeze({
+  daily_check_in: 1,
+  daily_one_ad: 1,
+  daily_three_ads: 1,
+  weekly_ten_ads: 3,
+});
 const REFERRAL_QUALIFYING_ADS = Number(
   process.env.REFERRAL_QUALIFYING_ADS || 5,
 );
@@ -453,6 +459,13 @@ function utcDayKey(timestamp = Date.now()) {
   return new Date(timestamp).toISOString().slice(0, 10);
 }
 
+function utcWeekKey(timestamp = Date.now()) {
+  const date = new Date(timestamp);
+  const daysSinceMonday = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - daysSinceMonday);
+  return date.toISOString().slice(0, 10);
+}
+
 async function grantVerifiedAdReward(callback) {
   const {
     adUnit,
@@ -499,6 +512,11 @@ async function grantVerifiedAdReward(callback) {
       wallet.dailyRewardDate === today
         ? Number(wallet.dailyRewardCount || 0)
         : 0;
+    const week = utcWeekKey(now);
+    const previousWeeklyCount =
+      wallet.weeklyRewardWeek === week
+        ? Number(wallet.weeklyRewardCount || 0)
+        : 0;
 
     if (previousCount >= DAILY_REWARD_LIMIT) {
       transaction.create(claimRef, {
@@ -525,6 +543,8 @@ async function grantVerifiedAdReward(callback) {
         coins: nextCoins,
         dailyRewardDate: today,
         dailyRewardCount: previousCount + 1,
+        weeklyRewardWeek: week,
+        weeklyRewardCount: previousWeeklyCount + 1,
         lifetimeVerifiedAds,
         updatedAt: FieldValue.serverTimestamp(),
       },
@@ -939,6 +959,7 @@ async function deleteUserAccount(uid) {
     ['offerClaims', 'userId'],
     ['promoClaims', 'userId'],
     ['rewardClaims', 'userId'],
+    ['missionClaims', 'userId'],
     ['transactions', 'userId'],
     ['referralCodes', 'ownerUid'],
     ['referrals', 'inviterUid'],
@@ -1029,6 +1050,180 @@ async function grantDailyBonus(uid) {
       claimed: true,
       alreadyClaimed: false,
       streak,
+      coins: rewardCoins,
+      balance: nextBalance,
+    };
+  });
+}
+
+function missionPeriod(missionId, now = Date.now()) {
+  return missionId.startsWith('weekly_')
+    ? utcWeekKey(now)
+    : utcDayKey(now);
+}
+
+function missionProgress(wallet, missionId, now = Date.now()) {
+  const today = utcDayKey(now);
+  const week = utcWeekKey(now);
+  const dailyAds =
+    wallet.dailyRewardDate === today
+      ? Number(wallet.dailyRewardCount || 0)
+      : 0;
+  const weeklyAds =
+    wallet.weeklyRewardWeek === week
+      ? Number(wallet.weeklyRewardCount || 0)
+      : 0;
+
+  switch (missionId) {
+    case 'daily_check_in':
+      return wallet.dailyBonusLastClaimDate === today ? 1 : 0;
+    case 'daily_one_ad':
+      return Math.min(dailyAds, 1);
+    case 'daily_three_ads':
+      return Math.min(dailyAds, 3);
+    case 'weekly_ten_ads':
+      return Math.min(weeklyAds, 10);
+    default:
+      return 0;
+  }
+}
+
+function missionTarget(missionId) {
+  switch (missionId) {
+    case 'daily_check_in':
+    case 'daily_one_ad':
+      return 1;
+    case 'daily_three_ads':
+      return 3;
+    case 'weekly_ten_ads':
+      return 10;
+    default:
+      return 0;
+  }
+}
+
+function missionTitle(missionId) {
+  switch (missionId) {
+    case 'daily_check_in':
+      return 'Claim today\'s check-in';
+    case 'daily_one_ad':
+      return 'Complete 1 optional rewarded ad';
+    case 'daily_three_ads':
+      return 'Complete 3 optional rewarded ads';
+    case 'weekly_ten_ads':
+      return 'Complete 10 rewarded ads this week';
+    default:
+      return 'Mission';
+  }
+}
+
+function missionClaimId(uid, missionId, now = Date.now()) {
+  return `${uid}_${missionId}_${missionPeriod(missionId, now)}`;
+}
+
+async function missionStatus(uid) {
+  const walletSnapshot = await firestore.collection('wallets').doc(uid).get();
+  const wallet = walletSnapshot.data() || {};
+  const missionIds = Object.keys(MISSION_REWARDS);
+  const claimSnapshots = await Promise.all(
+    missionIds.map((missionId) =>
+      firestore
+        .collection('missionClaims')
+        .doc(missionClaimId(uid, missionId))
+        .get(),
+    ),
+  );
+  const missions = missionIds.map((missionId, index) => {
+    const progress = missionProgress(wallet, missionId);
+    const target = missionTarget(missionId);
+    return {
+      id: missionId,
+      title: missionTitle(missionId),
+      period: missionId.startsWith('weekly_') ? 'weekly' : 'daily',
+      progress,
+      target,
+      rewardCoins: MISSION_REWARDS[missionId],
+      completed: progress >= target,
+      claimed: claimSnapshots[index].exists,
+    };
+  });
+  const lifetimeVerifiedAds = Number(wallet.lifetimeVerifiedAds || 0);
+  const streak = Number(wallet.dailyBonusStreak || 0);
+  const xp = lifetimeVerifiedAds * 10 + streak * 2;
+  return {
+    missions,
+    profile: {
+      xp,
+      level: Math.floor(Math.sqrt(xp / 50)) + 1,
+      rank:
+        xp >= 700
+          ? 'Diamond'
+          : xp >= 300
+            ? 'Gold'
+            : xp >= 100
+              ? 'Silver'
+              : 'Bronze',
+    },
+  };
+}
+
+async function claimMission(uid, missionId) {
+  if (!Object.hasOwn(MISSION_REWARDS, missionId)) {
+    const error = new Error('Unknown mission.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const now = Date.now();
+  const claimId = missionClaimId(uid, missionId, now);
+  const claimRef = firestore.collection('missionClaims').doc(claimId);
+  const walletRef = firestore.collection('wallets').doc(uid);
+  const transactionRef = firestore.collection('transactions').doc(claimId);
+
+  return firestore.runTransaction(async (transaction) => {
+    const [claimSnapshot, walletSnapshot] = await Promise.all([
+      transaction.get(claimRef),
+      transaction.get(walletRef),
+    ]);
+    if (claimSnapshot.exists) {
+      return { claimed: false, alreadyClaimed: true, coins: 0 };
+    }
+    const wallet = walletSnapshot.data() || {};
+    const progress = missionProgress(wallet, missionId, now);
+    const target = missionTarget(missionId);
+    if (progress < target) {
+      const error = new Error('Complete the mission before claiming.');
+      error.statusCode = 400;
+      throw error;
+    }
+    const rewardCoins = MISSION_REWARDS[missionId];
+    const nextBalance = Number(wallet.coins || 0) + rewardCoins;
+    transaction.create(claimRef, {
+      userId: uid,
+      missionId,
+      period: missionPeriod(missionId, now),
+      coins: rewardCoins,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    transaction.set(
+      walletRef,
+      {
+        uid,
+        coins: nextBalance,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    transaction.create(transactionRef, {
+      userId: uid,
+      type: 'mission_bonus',
+      missionId,
+      coins: rewardCoins,
+      balanceAfter: nextBalance,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    return {
+      claimed: true,
+      alreadyClaimed: false,
       coins: rewardCoins,
       balance: nextBalance,
     };
@@ -1326,6 +1521,64 @@ app.post(
 );
 
 app.post(
+  '/rewards/missions/status',
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, [])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+    try {
+      const result = await missionStatus(request.firebaseUser.uid);
+      return response.json({ success: true, ...result });
+    } catch (error) {
+      console.error('Mission status failed:', error.message);
+      return response.status(500).json({
+        success: false,
+        message: 'Missions are temporarily unavailable.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/rewards/missions/claim',
+  dailyBonusIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, ['missionId'])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+    try {
+      const missionId = String(request.body.missionId || '');
+      const result = await claimMission(request.firebaseUser.uid, missionId);
+      return response.json({
+        success: true,
+        ...result,
+        message: result.alreadyClaimed
+          ? 'Mission reward is already claimed.'
+          : `Mission completed: +${result.coins} coin${
+              result.coins === 1 ? '' : 's'
+            }.`,
+      });
+    } catch (error) {
+      console.warn('Mission claim rejected:', error.message);
+      return response.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Unable to claim this mission.',
+      });
+    }
+  },
+);
+
+app.post(
   '/rewards/referral/status',
   verifyAppCheck,
   verifyFirebaseUser,
@@ -1532,6 +1785,11 @@ module.exports = {
   validOtp,
   validFirebaseUid,
   normalizeAdMobTimestamp,
+  missionClaimId,
+  missionPeriod,
+  missionProgress,
+  missionTarget,
+  utcWeekKey,
   bitLabsSignature,
   stripBitLabsHash,
   verifyBitLabsCallback,

@@ -21,6 +21,8 @@ process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 = Buffer.from(
 const {
   nextDailyStreak,
   bitLabsSignature,
+  calculateMemoryScore,
+  isTestRewardUid,
   normalizeAdMobTimestamp,
   missionClaimId,
   missionPeriod,
@@ -28,6 +30,8 @@ const {
   missionTarget,
   referralCodeForUid,
   stripBitLabsHash,
+  triviaScore,
+  testRewardDocumentIds,
   validFirebaseUid,
   validIndianMobile,
   validOtp,
@@ -77,6 +81,32 @@ test('calculates daily and weekly mission progress on UTC periods', () => {
     missionClaimId('user_12345678', 'daily_one_ad', now),
     /user_12345678_daily_one_ad_2026-08-01/,
   );
+});
+
+test('calculates bounded memory scores on the server', () => {
+  assert.equal(calculateMemoryScore(10, 30), 1180);
+  assert.equal(calculateMemoryScore(100, 900), 100);
+  assert.equal(calculateMemoryScore(1, 1), 1360);
+});
+
+test('scores trivia answers from server-owned answer keys', () => {
+  assert.equal(
+    triviaScore(['red_planet', 'india_capital', 'plant_gas'], [1, 0, 2]),
+    2,
+  );
+  assert.equal(triviaScore(['unknown'], [1]), 0);
+  assert.equal(triviaScore(null, []), 0);
+});
+
+test('keeps developer test rewards disabled without an allowlist', () => {
+  assert.equal(isTestRewardUid('user_12345678'), false);
+  const ids = testRewardDocumentIds(
+    'user_12345678',
+    Date.parse('2026-08-01T12:00:00Z'),
+  );
+  assert.equal(ids.length, 3);
+  assert.match(ids[0], /daily_one_ad_2026-08-01$/);
+  assert.match(ids[2], /weekly_ten_ads_2026-07-27$/);
 });
 
 test('verifies an ECDSA signed callback payload without modifying it', () => {

@@ -18,6 +18,14 @@ const FIREBASE_PROJECT_ID =
   process.env.FIREBASE_PROJECT_ID || 'watch-and-earn-28a25';
 const ENFORCE_APP_CHECK =
   String(process.env.ENFORCE_APP_CHECK || 'false').toLowerCase() === 'true';
+const TEST_REWARDS_ENABLED =
+  String(process.env.TEST_REWARDS_ENABLED || 'false').toLowerCase() === 'true';
+const TEST_REWARD_UIDS = new Set(
+  String(process.env.TEST_REWARD_UIDS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
 const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || '')
   .split(',')
   .map((value) => value.trim().replace(/\/$/, ''))
@@ -25,6 +33,7 @@ const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || '')
 const ADMOB_REWARDED_AD_UNIT_ID = String(
   process.env.ADMOB_REWARDED_AD_UNIT_ID || '3026961468',
 ).trim();
+const ADMOB_TEST_REWARDED_AD_UNIT_ID = '5224354917';
 const ADMOB_REWARD_AMOUNT = Number(process.env.ADMOB_REWARD_AMOUNT || 1);
 const COINS_PER_REWARD = Number(process.env.COINS_PER_REWARD || 1);
 const DAILY_REWARD_LIMIT = Number(process.env.DAILY_REWARD_LIMIT || 5);
@@ -34,6 +43,47 @@ const MISSION_REWARDS = Object.freeze({
   daily_three_ads: 1,
   weekly_ten_ads: 3,
 });
+const MEMORY_DAILY_XP = 5;
+const TRIVIA_XP_PER_CORRECT = 2;
+const GAME_SESSION_TTL_MS = 15 * 60 * 1000;
+const TRIVIA_QUESTIONS = Object.freeze([
+  {
+    id: 'red_planet',
+    question: 'Which planet is known as the Red Planet?',
+    options: ['Earth', 'Mars', 'Venus', 'Jupiter'],
+    answer: 1,
+  },
+  {
+    id: 'india_capital',
+    question: 'What is the capital of India?',
+    options: ['Mumbai', 'New Delhi', 'Kolkata', 'Chennai'],
+    answer: 1,
+  },
+  {
+    id: 'plant_gas',
+    question: 'Which gas do plants absorb from the air?',
+    options: ['Oxygen', 'Nitrogen', 'Carbon dioxide', 'Hydrogen'],
+    answer: 2,
+  },
+  {
+    id: 'leap_year',
+    question: 'How many days are there in a leap year?',
+    options: ['365', '366', '364', '360'],
+    answer: 1,
+  },
+  {
+    id: 'largest_ocean',
+    question: 'Which is the largest ocean on Earth?',
+    options: ['Indian', 'Atlantic', 'Arctic', 'Pacific'],
+    answer: 3,
+  },
+  {
+    id: 'water_formula',
+    question: 'What is the chemical formula for water?',
+    options: ['CO2', 'O2', 'H2O', 'NaCl'],
+    answer: 2,
+  },
+]);
 const REFERRAL_QUALIFYING_ADS = Number(
   process.env.REFERRAL_QUALIFYING_ADS || 5,
 );
@@ -459,6 +509,10 @@ function utcDayKey(timestamp = Date.now()) {
   return new Date(timestamp).toISOString().slice(0, 10);
 }
 
+function isTestRewardUid(uid) {
+  return TEST_REWARDS_ENABLED && TEST_REWARD_UIDS.has(String(uid || ''));
+}
+
 function utcWeekKey(timestamp = Date.now()) {
   const date = new Date(timestamp);
   const daysSinceMonday = (date.getUTCDay() + 6) % 7;
@@ -477,8 +531,11 @@ async function grantVerifiedAdReward(callback) {
   } = callback;
   const now = Date.now();
 
+  const validAdUnit =
+    adUnit === ADMOB_REWARDED_AD_UNIT_ID ||
+    (adUnit === ADMOB_TEST_REWARDED_AD_UNIT_ID && isTestRewardUid(uid));
   if (
-    adUnit !== ADMOB_REWARDED_AD_UNIT_ID ||
+    !validAdUnit ||
     rewardAmount !== ADMOB_REWARD_AMOUNT ||
     !validFirebaseUid(uid) ||
     !/^[A-Za-z0-9_-]{8,128}$/.test(String(transactionId || '')) ||
@@ -960,6 +1017,7 @@ async function deleteUserAccount(uid) {
     ['promoClaims', 'userId'],
     ['rewardClaims', 'userId'],
     ['missionClaims', 'userId'],
+    ['gameSessions', 'userId'],
     ['transactions', 'userId'],
     ['referralCodes', 'ownerUid'],
     ['referrals', 'inviterUid'],
@@ -975,6 +1033,7 @@ async function deleteUserAccount(uid) {
     firestore.collection('users').doc(uid),
     firestore.collection('wallets').doc(uid),
     firestore.collection('referrals').doc(uid),
+    firestore.collection('testRewardBaselines').doc(uid),
   ]) {
     refs.set(ref.path, ref);
   }
@@ -1149,9 +1208,58 @@ async function missionStatus(uid) {
   });
   const lifetimeVerifiedAds = Number(wallet.lifetimeVerifiedAds || 0);
   const streak = Number(wallet.dailyBonusStreak || 0);
-  const xp = lifetimeVerifiedAds * 10 + streak * 2;
+  const gameXp = Number(wallet.gameXp || 0);
+  const xp = lifetimeVerifiedAds * 10 + streak * 2 + gameXp;
+  const achievements = [
+    {
+      id: 'first_steps',
+      title: 'First Steps',
+      description: 'Reach 10 XP.',
+      icon: 'bolt',
+      progress: Math.min(xp, 10),
+      target: 10,
+      unlocked: xp >= 10,
+    },
+    {
+      id: 'mission_maker',
+      title: 'Mission Maker',
+      description: 'Claim your first verified mission.',
+      icon: 'flag',
+      progress: Math.min(Number(wallet.missionsClaimed || 0), 1),
+      target: 1,
+      unlocked: Number(wallet.missionsClaimed || 0) >= 1,
+    },
+    {
+      id: 'streak_three',
+      title: 'On a Roll',
+      description: 'Build a 3-day check-in streak.',
+      icon: 'calendar',
+      progress: Math.min(streak, 3),
+      target: 3,
+      unlocked: streak >= 3,
+    },
+    {
+      id: 'memory_master',
+      title: 'Memory Master',
+      description: 'Score 1,000 in Memory Match.',
+      icon: 'memory',
+      progress: Math.min(Number(wallet.memoryBestScore || 0), 1000),
+      target: 1000,
+      unlocked: Number(wallet.memoryBestScore || 0) >= 1000,
+    },
+    {
+      id: 'trivia_star',
+      title: 'Trivia Star',
+      description: 'Score 80 or more in Trivia Quiz.',
+      icon: 'quiz',
+      progress: Math.min(Number(wallet.triviaBestScore || 0), 80),
+      target: 80,
+      unlocked: Number(wallet.triviaBestScore || 0) >= 80,
+    },
+  ];
   return {
     missions,
+    achievements,
     profile: {
       xp,
       level: Math.floor(Math.sqrt(xp / 50)) + 1,
@@ -1163,6 +1271,10 @@ async function missionStatus(uid) {
             : xp >= 100
               ? 'Silver'
               : 'Bronze',
+      streak,
+      lastDailyClaim: wallet.dailyBonusLastClaimDate || null,
+      memoryBestScore: Number(wallet.memoryBestScore || 0),
+      triviaBestScore: Number(wallet.triviaBestScore || 0),
     },
   };
 }
@@ -1209,6 +1321,7 @@ async function claimMission(uid, missionId) {
       {
         uid,
         coins: nextBalance,
+        missionsClaimed: Number(wallet.missionsClaimed || 0) + 1,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
@@ -1228,6 +1341,304 @@ async function claimMission(uid, missionId) {
       balance: nextBalance,
     };
   });
+}
+
+function calculateMemoryScore(moves, seconds) {
+  const safeMoves = Math.max(6, Math.min(100, Number(moves) || 100));
+  const safeSeconds = Math.max(5, Math.min(900, Number(seconds) || 900));
+  return Math.max(100, 1500 - safeMoves * 20 - safeSeconds * 4);
+}
+
+function triviaScore(questionIds, answers) {
+  if (!Array.isArray(questionIds) || !Array.isArray(answers)) return 0;
+  return questionIds.reduce((correct, questionId, index) => {
+    const question = TRIVIA_QUESTIONS.find((item) => item.id === questionId);
+    return correct + (question && answers[index] === question.answer ? 1 : 0);
+  }, 0);
+}
+
+async function startGameSession(uid, game) {
+  if (!['memory', 'trivia'].includes(game)) {
+    const error = new Error('Unknown game.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const now = Date.now();
+  const sessionId = crypto.randomUUID();
+  const session = {
+    userId: uid,
+    game,
+    startedAtMs: now,
+    expiresAtMs: now + GAME_SESSION_TTL_MS,
+    completed: false,
+    createdAt: FieldValue.serverTimestamp(),
+  };
+  let questions;
+  if (game === 'trivia') {
+    questions = [...TRIVIA_QUESTIONS]
+      .sort(() => crypto.randomInt(0, 3) - 1)
+      .slice(0, 5);
+    session.questionIds = questions.map((item) => item.id);
+  }
+  await firestore.collection('gameSessions').doc(sessionId).create(session);
+  return {
+    sessionId,
+    ...(questions
+      ? {
+          questions: questions.map(({ id, question, options }) => ({
+            id,
+            question,
+            options,
+          })),
+        }
+      : {}),
+  };
+}
+
+async function completeMemoryGame(uid, sessionId, moves) {
+  const now = Date.now();
+  const sessionRef = firestore.collection('gameSessions').doc(sessionId);
+  const walletRef = firestore.collection('wallets').doc(uid);
+  return firestore.runTransaction(async (transaction) => {
+    const [sessionSnapshot, walletSnapshot] = await Promise.all([
+      transaction.get(sessionRef),
+      transaction.get(walletRef),
+    ]);
+    const session = sessionSnapshot.data();
+    const elapsedSeconds = Math.floor((now - Number(session?.startedAtMs)) / 1000);
+    if (
+      !sessionSnapshot.exists ||
+      session.userId !== uid ||
+      session.game !== 'memory' ||
+      session.completed === true ||
+      Number(session.expiresAtMs) < now ||
+      !Number.isInteger(moves) ||
+      moves < 6 ||
+      moves > 100 ||
+      elapsedSeconds < 5
+    ) {
+      const error = new Error('Memory result failed server validation.');
+      error.statusCode = 400;
+      throw error;
+    }
+    const wallet = walletSnapshot.data() || {};
+    const score = calculateMemoryScore(moves, elapsedSeconds);
+    const today = utcDayKey(now);
+    const xpAwarded = wallet.memoryXpDate === today ? 0 : MEMORY_DAILY_XP;
+    const bestScore = Math.max(Number(wallet.memoryBestScore || 0), score);
+    transaction.update(sessionRef, {
+      completed: true,
+      moves,
+      seconds: elapsedSeconds,
+      score,
+      xpAwarded,
+      completedAt: FieldValue.serverTimestamp(),
+    });
+    transaction.set(
+      walletRef,
+      {
+        uid,
+        gameXp: Number(wallet.gameXp || 0) + xpAwarded,
+        memoryXpDate: xpAwarded > 0 ? today : wallet.memoryXpDate || today,
+        memoryBestScore: bestScore,
+        memoryGamesCompleted: Number(wallet.memoryGamesCompleted || 0) + 1,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return { score, bestScore, seconds: elapsedSeconds, xpAwarded };
+  });
+}
+
+async function completeTriviaGame(uid, sessionId, answers) {
+  const now = Date.now();
+  const sessionRef = firestore.collection('gameSessions').doc(sessionId);
+  const walletRef = firestore.collection('wallets').doc(uid);
+  return firestore.runTransaction(async (transaction) => {
+    const [sessionSnapshot, walletSnapshot] = await Promise.all([
+      transaction.get(sessionRef),
+      transaction.get(walletRef),
+    ]);
+    const session = sessionSnapshot.data();
+    const questionIds = session?.questionIds;
+    if (
+      !sessionSnapshot.exists ||
+      session.userId !== uid ||
+      session.game !== 'trivia' ||
+      session.completed === true ||
+      Number(session.expiresAtMs) < now ||
+      !Array.isArray(questionIds) ||
+      !Array.isArray(answers) ||
+      answers.length !== questionIds.length ||
+      answers.some((answer) => !Number.isInteger(answer) || answer < 0 || answer > 3)
+    ) {
+      const error = new Error('Trivia result failed server validation.');
+      error.statusCode = 400;
+      throw error;
+    }
+    const wallet = walletSnapshot.data() || {};
+    const correct = triviaScore(questionIds, answers);
+    const score = correct * 20;
+    const today = utcDayKey(now);
+    const xpAwarded =
+      wallet.triviaXpDate === today ? 0 : correct * TRIVIA_XP_PER_CORRECT;
+    const bestScore = Math.max(Number(wallet.triviaBestScore || 0), score);
+    transaction.update(sessionRef, {
+      completed: true,
+      answers,
+      correct,
+      score,
+      xpAwarded,
+      completedAt: FieldValue.serverTimestamp(),
+    });
+    transaction.set(
+      walletRef,
+      {
+        uid,
+        gameXp: Number(wallet.gameXp || 0) + xpAwarded,
+        triviaXpDate: xpAwarded > 0 ? today : wallet.triviaXpDate || today,
+        triviaBestScore: bestScore,
+        triviaGamesCompleted: Number(wallet.triviaGamesCompleted || 0) + 1,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return { correct, total: questionIds.length, score, bestScore, xpAwarded };
+  });
+}
+
+const TEST_WALLET_FIELDS = Object.freeze([
+  'coins',
+  'gameXp',
+  'dailyRewardDate',
+  'dailyRewardCount',
+  'weeklyRewardWeek',
+  'weeklyRewardCount',
+  'lifetimeVerifiedAds',
+  'memoryXpDate',
+  'memoryBestScore',
+  'memoryGamesCompleted',
+  'triviaXpDate',
+  'triviaBestScore',
+  'triviaGamesCompleted',
+]);
+
+function testRewardDocumentIds(uid, now = Date.now()) {
+  const missionIds = ['daily_one_ad', 'daily_three_ads', 'weekly_ten_ads'];
+  return missionIds.map((missionId) => missionClaimId(uid, missionId, now));
+}
+
+async function applyTestRewardAction(uid, action) {
+  if (!isTestRewardUid(uid)) {
+    const error = new Error('Test rewards are disabled for this account.');
+    error.statusCode = 403;
+    throw error;
+  }
+  const allowedActions = new Set([
+    'add_test_coins',
+    'add_test_xp',
+    'complete_daily_task',
+    'complete_weekly_mission',
+    'reset_test_progress',
+  ]);
+  if (!allowedActions.has(action)) {
+    const error = new Error('Unknown test action.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const now = Date.now();
+  const today = utcDayKey(now);
+  const week = utcWeekKey(now);
+  const walletRef = firestore.collection('wallets').doc(uid);
+  const baselineRef = firestore.collection('testRewardBaselines').doc(uid);
+  const documentIds = testRewardDocumentIds(uid, now);
+  const claimRefs = documentIds.map((id) =>
+    firestore.collection('missionClaims').doc(id),
+  );
+  const transactionRefs = documentIds.map((id) =>
+    firestore.collection('transactions').doc(id),
+  );
+
+  await firestore.runTransaction(async (transaction) => {
+    const refs = [baselineRef, walletRef, ...claimRefs, ...transactionRefs];
+    const snapshots = await Promise.all(refs.map((ref) => transaction.get(ref)));
+    const baselineSnapshot = snapshots[0];
+    const walletSnapshot = snapshots[1];
+    const wallet = walletSnapshot.data() || {};
+
+    if (action === 'reset_test_progress') {
+      if (!baselineSnapshot.exists) return;
+      const baseline = baselineSnapshot.data() || {};
+      const originalWallet = baseline.wallet || {};
+      const restoration = { updatedAt: FieldValue.serverTimestamp() };
+      for (const field of TEST_WALLET_FIELDS) {
+        restoration[field] = Object.hasOwn(originalWallet, field)
+          ? originalWallet[field]
+          : FieldValue.delete();
+      }
+      transaction.set(walletRef, restoration, { merge: true });
+      for (let index = 0; index < documentIds.length; index += 1) {
+        const id = documentIds[index];
+        const originalClaim = baseline.claims?.[id];
+        const originalTransaction = baseline.transactions?.[id];
+        if (originalClaim) transaction.set(claimRefs[index], originalClaim);
+        else transaction.delete(claimRefs[index]);
+        if (originalTransaction) {
+          transaction.set(transactionRefs[index], originalTransaction);
+        } else {
+          transaction.delete(transactionRefs[index]);
+        }
+      }
+      transaction.delete(baselineRef);
+      return;
+    }
+
+    if (!baselineSnapshot.exists) {
+      const originalWallet = {};
+      for (const field of TEST_WALLET_FIELDS) {
+        if (Object.hasOwn(wallet, field)) originalWallet[field] = wallet[field];
+      }
+      const claims = {};
+      const transactions = {};
+      for (let index = 0; index < documentIds.length; index += 1) {
+        const claimData = snapshots[2 + index].data();
+        const transactionData = snapshots[2 + documentIds.length + index].data();
+        if (claimData) claims[documentIds[index]] = claimData;
+        if (transactionData) transactions[documentIds[index]] = transactionData;
+      }
+      transaction.create(baselineRef, {
+        userId: uid,
+        wallet: originalWallet,
+        claims,
+        transactions,
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    }
+
+    const update = { uid, updatedAt: FieldValue.serverTimestamp() };
+    switch (action) {
+      case 'add_test_coins':
+        update.coins = Number(wallet.coins || 0) + 100;
+        break;
+      case 'add_test_xp':
+        update.gameXp = Number(wallet.gameXp || 0) + 50;
+        break;
+      case 'complete_daily_task':
+        update.dailyRewardDate = today;
+        update.dailyRewardCount = Math.max(Number(wallet.dailyRewardCount || 0), 3);
+        break;
+      case 'complete_weekly_mission':
+        update.weeklyRewardWeek = week;
+        update.weeklyRewardCount = Math.max(Number(wallet.weeklyRewardCount || 0), 10);
+        break;
+      default:
+        break;
+    }
+    transaction.set(walletRef, update, { merge: true });
+  });
+
+  return missionStatus(uid);
 }
 
 async function fast2smsRequest(endpoint, body) {
@@ -1579,6 +1990,105 @@ app.post(
 );
 
 app.post(
+  '/rewards/games/start',
+  dailyBonusIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, ['game'])) {
+      return response.status(400).json({ success: false, message: 'Invalid request.' });
+    }
+    try {
+      const result = await startGameSession(
+        request.firebaseUser.uid,
+        String(request.body.game || ''),
+      );
+      return response.json({ success: true, ...result });
+    } catch (error) {
+      return response.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Unable to start the game.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/rewards/games/memory/complete',
+  dailyBonusIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, ['sessionId', 'moves'])) {
+      return response.status(400).json({ success: false, message: 'Invalid request.' });
+    }
+    try {
+      const result = await completeMemoryGame(
+        request.firebaseUser.uid,
+        String(request.body.sessionId || ''),
+        request.body.moves,
+      );
+      return response.json({ success: true, ...result });
+    } catch (error) {
+      return response.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Unable to validate the result.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/rewards/games/trivia/complete',
+  dailyBonusIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, ['sessionId', 'answers'])) {
+      return response.status(400).json({ success: false, message: 'Invalid request.' });
+    }
+    try {
+      const result = await completeTriviaGame(
+        request.firebaseUser.uid,
+        String(request.body.sessionId || ''),
+        request.body.answers,
+      );
+      return response.json({ success: true, ...result });
+    } catch (error) {
+      return response.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Unable to validate the result.',
+      });
+    }
+  },
+);
+
+app.post(
+  '/test/rewards/action',
+  dailyBonusIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, ['action'])) {
+      return response.status(400).json({ success: false, message: 'Invalid request.' });
+    }
+    try {
+      const result = await applyTestRewardAction(
+        request.firebaseUser.uid,
+        String(request.body.action || ''),
+      );
+      return response.json({ success: true, ...result });
+    } catch (error) {
+      console.warn('Test reward action rejected:', error.message);
+      return response.status(error.statusCode || 500).json({
+        success: false,
+        message: error.message || 'Test reward action failed.',
+      });
+    }
+  },
+);
+
+app.post(
   '/rewards/referral/status',
   verifyAppCheck,
   verifyFirebaseUser,
@@ -1789,6 +2299,10 @@ module.exports = {
   missionPeriod,
   missionProgress,
   missionTarget,
+  calculateMemoryScore,
+  triviaScore,
+  isTestRewardUid,
+  testRewardDocumentIds,
   utcWeekKey,
   bitLabsSignature,
   stripBitLabsHash,

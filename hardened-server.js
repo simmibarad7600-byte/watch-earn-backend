@@ -96,6 +96,13 @@ const BITLABS_APP_SECRET = String(process.env.BITLABS_APP_SECRET || '').trim();
 const BITLABS_MAX_COINS_PER_CALLBACK = Number(
   process.env.BITLABS_MAX_COINS_PER_CALLBACK || 100,
 );
+const CPX_ENABLED =
+  String(process.env.CPX_ENABLED || 'false').toLowerCase() === 'true';
+const CPX_APP_ID = String(process.env.CPX_APP_ID || '').trim();
+const CPX_APP_SECURE_HASH = String(
+  process.env.CPX_APP_SECURE_HASH || '',
+).trim();
+const CPX_USER_SHARE_BPS = Number(process.env.CPX_USER_SHARE_BPS || 5000);
 const AYET_ENABLED =
   String(process.env.AYET_ENABLED || 'false').toLowerCase() === 'true';
 const AYET_API_KEY = String(process.env.AYET_API_KEY || '').trim();
@@ -107,6 +114,11 @@ const AYET_MAX_PAYOUT_USD_MICROS = Number(
   process.env.AYET_MAX_PAYOUT_USD_MICROS || 100_000_000,
 );
 const AYET_HOLD_DAYS = Number(process.env.AYET_HOLD_DAYS || 30);
+const CASH_EARN_HUB_ENABLED =
+  String(process.env.CASH_EARN_HUB_ENABLED || 'false').toLowerCase() === 'true';
+const CASH_DAILY_GOAL_USD_MICROS = Number(
+  process.env.CASH_DAILY_GOAL_USD_MICROS || 1_000_000,
+);
 const ADMOB_KEYS_URL =
   'https://www.gstatic.com/admob/reward/verifier-keys.json';
 
@@ -123,6 +135,18 @@ function ensureConfiguration() {
   if (!FAST2SMS_API_KEY) missing.push('FAST2SMS_API_KEY');
   if (!process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
     missing.push('FIREBASE_SERVICE_ACCOUNT_BASE64');
+  }
+  if (CPX_ENABLED && !CPX_APP_ID) missing.push('CPX_APP_ID');
+  if (CPX_ENABLED && !CPX_APP_SECURE_HASH) {
+    missing.push('CPX_APP_SECURE_HASH');
+  }
+  if (
+    CPX_ENABLED &&
+    (!Number.isInteger(CPX_USER_SHARE_BPS) ||
+      CPX_USER_SHARE_BPS < 1 ||
+      CPX_USER_SHARE_BPS > 9000)
+  ) {
+    missing.push('CPX_USER_SHARE_BPS (integer from 1 to 9000)');
   }
   if (AYET_ENABLED && !AYET_API_KEY) missing.push('AYET_API_KEY');
   if (
@@ -147,6 +171,12 @@ function ensureConfiguration() {
       AYET_HOLD_DAYS > 90)
   ) {
     missing.push('AYET_HOLD_DAYS (integer from 1 to 90)');
+  }
+  if (
+    !Number.isSafeInteger(CASH_DAILY_GOAL_USD_MICROS) ||
+    CASH_DAILY_GOAL_USD_MICROS < 1
+  ) {
+    missing.push('CASH_DAILY_GOAL_USD_MICROS (positive integer)');
   }
   if (missing.length > 0) {
     throw new Error(`Missing required environment values: ${missing.join(', ')}`);
@@ -257,6 +287,17 @@ const dailyBonusIpLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many bonus requests. Please try again later.',
+  },
+});
+
+const cashSummaryIpLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many wallet refreshes. Please wait a moment.',
   },
 });
 
@@ -586,6 +627,61 @@ function verifyBitLabsCallback(fullUrl, secret) {
     throw new Error('BitLabs callback values failed validation.');
   }
   return { uid, transactionId, coins, usdValue };
+}
+
+function cpxSignature(transactionId, secret) {
+  return crypto
+    .createHash('md5')
+    .update(`${transactionId}-${secret}`, 'utf8')
+    .digest('hex');
+}
+
+function verifyCpxCallback(fullUrl, secret, shareBps) {
+  if (!secret) throw new Error('CPX secure hash is not configured.');
+  const parsed = new URL(String(fullUrl || ''), 'https://callback.invalid');
+  const uid = parsed.searchParams.get('user_id');
+  const providerTransactionId = parsed.searchParams.get('trans_id');
+  const suppliedHash = parsed.searchParams.get('hash');
+  const status = parsed.searchParams.get('status');
+  const eventType = String(parsed.searchParams.get('type') || '').toLowerCase();
+  const payoutUsdMicros = decimalUsdToMicros(
+    parsed.searchParams.get('amount_usd'),
+  );
+
+  if (
+    !validFirebaseUid(uid) ||
+    !/^[A-Za-z0-9:_-]{1,160}$/.test(String(providerTransactionId || '')) ||
+    !['1', '2'].includes(String(status || '')) ||
+    !/^[a-f0-9]{32}$/i.test(String(suppliedHash || '')) ||
+    !Number.isSafeInteger(payoutUsdMicros) ||
+    payoutUsdMicros < 0
+  ) {
+    throw new Error('CPX callback values failed validation.');
+  }
+  const expectedHash = cpxSignature(providerTransactionId, secret);
+  if (!safeHexEqual(expectedHash, suppliedHash)) {
+    throw new Error('Invalid CPX callback signature.');
+  }
+
+  const isChargeback = status === '2';
+  const userRewardUsdMicros = calculateAyetUserReward(
+    payoutUsdMicros,
+    shareBps,
+  );
+  return {
+    provider: 'cpx',
+    uid,
+    transactionId: isChargeback
+      ? `${providerTransactionId}_reversal`
+      : providerTransactionId,
+    originalTransactionId: providerTransactionId,
+    placementIdentifier: CPX_APP_ID,
+    payoutUsdMicros: isChargeback ? -payoutUsdMicros : payoutUsdMicros,
+    userRewardUsdMicros,
+    isChargeback,
+    isSandbox: false,
+    eventType,
+  };
 }
 
 async function getAdMobPublicKeys() {
@@ -1163,6 +1259,8 @@ async function deleteUserAccount(uid) {
     ['missionClaims', 'userId'],
     ['gameSessions', 'userId'],
     ['transactions', 'userId'],
+    ['cashClaims', 'userId'],
+    ['cashTransactions', 'userId'],
     ['referralCodes', 'ownerUid'],
     ['referrals', 'inviterUid'],
   ];
@@ -1176,6 +1274,7 @@ async function deleteUserAccount(uid) {
   for (const ref of [
     firestore.collection('users').doc(uid),
     firestore.collection('wallets').doc(uid),
+    firestore.collection('cashWallets').doc(uid),
     firestore.collection('referrals').doc(uid),
     firestore.collection('testRewardBaselines').doc(uid),
   ]) {
@@ -1259,6 +1358,106 @@ async function grantDailyBonus(uid) {
   });
 }
 
+function safeCashAmount(value, fieldName) {
+  const amount = Number(value || 0);
+  if (!Number.isSafeInteger(amount) || amount < 0) {
+    throw new Error(`Invalid cash wallet field: ${fieldName}.`);
+  }
+  return amount;
+}
+
+function timestampIso(value) {
+  if (!value) return null;
+  if (typeof value.toDate === 'function') return value.toDate().toISOString();
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+async function cashSummaryForUser(uid) {
+  const [walletSnapshot, transactionSnapshot] = await Promise.all([
+    firestore.collection('cashWallets').doc(uid).get(),
+    firestore
+      .collection('cashTransactions')
+      .where('userId', '==', uid)
+      .limit(50)
+      .get(),
+  ]);
+  const wallet = walletSnapshot.data() || {};
+  const now = Date.now();
+  const today = utcDayKey(now);
+  const transactions = transactionSnapshot.docs
+    .map((document) => {
+      const data = document.data() || {};
+      const amountUsdMicros = Number(data.amountUsdMicros || 0);
+      if (!Number.isSafeInteger(amountUsdMicros)) {
+        throw new Error('Invalid cash transaction amount.');
+      }
+      const createdAt = timestampIso(data.createdAt);
+      const isReversal = data.type === 'verified_offer_cash_reversal';
+      return {
+        id: document.id,
+        type: String(data.type || 'verified_offer_cash_reward'),
+        provider: String(data.provider || 'provider'),
+        currency: String(data.currency || 'USD'),
+        amountUsdMicros,
+        status: isReversal ? 'reversed' : 'pending_verification',
+        createdAt,
+        availableAt: timestampIso(data.availableAt),
+      };
+    })
+    .sort((left, right) =>
+      String(right.createdAt || '').localeCompare(String(left.createdAt || '')),
+    );
+  const earnedTodayUsdMicros = transactions.reduce((sum, transaction) => {
+    if (
+      transaction.amountUsdMicros > 0 &&
+      transaction.createdAt?.startsWith(today)
+    ) {
+      return sum + transaction.amountUsdMicros;
+    }
+    return sum;
+  }, 0);
+  const offerwallAvailable = Boolean(
+    CASH_EARN_HUB_ENABLED &&
+      ((AYET_ENABLED && AYET_PLACEMENT_IDENTIFIER) ||
+        (CPX_ENABLED && CPX_APP_ID && CPX_APP_SECURE_HASH)),
+  );
+
+  return {
+    providerStatus: offerwallAvailable ? 'available' : 'review_pending',
+    offerwallAvailable,
+    cpxAvailable: Boolean(
+      CASH_EARN_HUB_ENABLED && CPX_ENABLED && CPX_APP_ID && CPX_APP_SECURE_HASH,
+    ),
+    wallet: {
+      currency: String(wallet.currency || 'USD'),
+      pendingUsdMicros: safeCashAmount(
+        wallet.pendingUsdMicros,
+        'pendingUsdMicros',
+      ),
+      availableUsdMicros: safeCashAmount(
+        wallet.availableUsdMicros,
+        'availableUsdMicros',
+      ),
+      lifetimeEarnedUsdMicros: safeCashAmount(
+        wallet.lifetimeEarnedUsdMicros,
+        'lifetimeEarnedUsdMicros',
+      ),
+      lifetimeReversedUsdMicros: safeCashAmount(
+        wallet.lifetimeReversedUsdMicros,
+        'lifetimeReversedUsdMicros',
+      ),
+      debtUsdMicros: safeCashAmount(wallet.debtUsdMicros, 'debtUsdMicros'),
+    },
+    dailyGoal: {
+      earnedUsdMicros: earnedTodayUsdMicros,
+      targetUsdMicros: CASH_DAILY_GOAL_USD_MICROS,
+    },
+    payoutStatus: 'not_configured',
+    transactions,
+  };
+}
+
 async function grantAyetCashReward(callback) {
   const {
     uid,
@@ -1270,6 +1469,7 @@ async function grantAyetCashReward(callback) {
     isChargeback,
     isSandbox,
   } = callback;
+  const provider = callback.provider || 'ayet';
 
   // ayeT sandbox callbacks verify the integration only. They must never
   // modify a real user's wallet or create a claim that blocks production.
@@ -1293,15 +1493,15 @@ async function grantAyetCashReward(callback) {
 
   const claimRef = firestore
     .collection('cashClaims')
-    .doc(`ayet_${transactionId}`);
+    .doc(`${provider}_${transactionId}`);
   const originalClaimRef = firestore
     .collection('cashClaims')
-    .doc(`ayet_${originalTransactionId}`);
+    .doc(`${provider}_${originalTransactionId}`);
   const walletRef = firestore.collection('cashWallets').doc(uid);
   const userRef = firestore.collection('users').doc(uid);
   const transactionRef = firestore
     .collection('cashTransactions')
-    .doc(`ayet_${transactionId}`);
+    .doc(`${provider}_${transactionId}`);
 
   return firestore.runTransaction(async (transaction) => {
     if (!isChargeback) {
@@ -1353,7 +1553,7 @@ async function grantAyetCashReward(callback) {
         { merge: true },
       );
       transaction.create(claimRef, {
-        provider: 'ayet',
+        provider,
         userId: uid,
         providerTransactionId: transactionId,
         placementIdentifier,
@@ -1366,7 +1566,7 @@ async function grantAyetCashReward(callback) {
       transaction.create(transactionRef, {
         userId: uid,
         type: 'verified_offer_cash_reward',
-        provider: 'ayet',
+        provider,
         currency: 'USD',
         amountUsdMicros: userRewardUsdMicros,
         pendingBalanceAfterUsdMicros: nextPendingUsdMicros,
@@ -1393,19 +1593,19 @@ async function grantAyetCashReward(callback) {
       return { duplicate: true, credited: false, reversed: false };
     }
     if (!originalSnapshot.exists) {
-      throw new Error('Original ayeT cash claim was not found.');
+      throw new Error(`Original ${provider} cash claim was not found.`);
     }
     const originalClaim = originalSnapshot.data() || {};
     if (
-      originalClaim.provider !== 'ayet' ||
+      originalClaim.provider !== provider ||
       originalClaim.userId !== uid ||
       originalClaim.status === 'reversed'
     ) {
-      throw new Error('Original ayeT cash claim cannot be reversed.');
+      throw new Error(`Original ${provider} cash claim cannot be reversed.`);
     }
     const reversalUsdMicros = Number(originalClaim.userRewardUsdMicros || 0);
     if (!Number.isSafeInteger(reversalUsdMicros) || reversalUsdMicros < 0) {
-      throw new Error('Original ayeT reward value is invalid.');
+      throw new Error(`Original ${provider} reward value is invalid.`);
     }
 
     const wallet = walletSnapshot.data() || {};
@@ -1457,7 +1657,7 @@ async function grantAyetCashReward(callback) {
       reversedAt: FieldValue.serverTimestamp(),
     });
     transaction.create(claimRef, {
-      provider: 'ayet',
+      provider,
       userId: uid,
       providerTransactionId: transactionId,
       originalTransactionId,
@@ -1470,7 +1670,7 @@ async function grantAyetCashReward(callback) {
     transaction.create(transactionRef, {
       userId: uid,
       type: 'verified_offer_cash_reversal',
-      provider: 'ayet',
+      provider,
       currency: 'USD',
       amountUsdMicros: -reversalUsdMicros,
       providerTransactionId: transactionId,
@@ -2132,6 +2332,31 @@ app.post(
 );
 
 app.post(
+  '/cash/summary',
+  cashSummaryIpLimiter,
+  verifyAppCheck,
+  verifyFirebaseUser,
+  async (request, response) => {
+    if (!hasOnlyKeys(request.body, [])) {
+      return response.status(400).json({
+        success: false,
+        message: 'Invalid request.',
+      });
+    }
+    try {
+      const summary = await cashSummaryForUser(request.firebaseUser.uid);
+      return response.json({ success: true, ...summary });
+    } catch (error) {
+      console.error('Cash summary failed:', error.message);
+      return response.status(500).json({
+        success: false,
+        message: 'Cash wallet is temporarily unavailable.',
+      });
+    }
+  },
+);
+
+app.post(
   '/otp/send',
   sendOtpIpLimiter,
   verifyAppCheck,
@@ -2652,6 +2877,31 @@ app.get('/ayet/reward', async (request, response) => {
   }
 });
 
+app.get('/cpx/reward', async (request, response) => {
+  if (!CPX_ENABLED) {
+    return response.status(503).send('Provider disabled');
+  }
+  try {
+    const callback = verifyCpxCallback(
+      request.originalUrl,
+      CPX_APP_SECURE_HASH,
+      CPX_USER_SHARE_BPS,
+    );
+    const result = await grantAyetCashReward(callback);
+    console.info('Verified CPX cash callback processed:', {
+      transactionId: callback.transactionId,
+      credited: result.credited,
+      reversed: result.reversed,
+      duplicate: result.duplicate,
+      eventType: callback.eventType,
+    });
+    return response.status(200).send('OK');
+  } catch (error) {
+    console.warn('Rejected CPX cash callback:', error.message);
+    return response.status(400).send('Invalid callback');
+  }
+});
+
 app.use((_request, response) => {
   response.status(404).json({ success: false, message: 'Route not found.' });
 });
@@ -2711,5 +2961,7 @@ module.exports = {
   bitLabsSignature,
   stripBitLabsHash,
   verifyBitLabsCallback,
+  cpxSignature,
+  verifyCpxCallback,
   verifyEcdsaSignature,
 };

@@ -24,6 +24,7 @@ const {
   bitLabsSignature,
   calculateAyetUserReward,
   calculateMemoryScore,
+  cpxSignature,
   decimalUsdToMicros,
   isTestRewardUid,
   normalizeAdMobTimestamp,
@@ -41,6 +42,7 @@ const {
   validRewardCode,
   verifyAyetCallback,
   verifyBitLabsCallback,
+  verifyCpxCallback,
   verifyEcdsaSignature,
   utcWeekKey,
 } = require('./hardened-server');
@@ -155,6 +157,37 @@ test('verifies BitLabs HMAC callback and rejects tampering', () => {
   });
   assert.throws(
     () => verifyBitLabsCallback(signed.replace('val=3', 'val=30'), secret),
+    /signature/,
+  );
+});
+
+test('verifies CPX MD5 callbacks and maps reversals safely', () => {
+  const secret = 'cpx-test-secure-hash';
+  const transactionId = 'cpx_tx_123';
+  const hash = cpxSignature(transactionId, secret);
+  const completion =
+    `https://example.com/cpx/reward?status=1&trans_id=${transactionId}` +
+    `&user_id=phone_917600140353&amount_usd=0.80&type=complete&hash=${hash}`;
+  assert.deepEqual(verifyCpxCallback(completion, secret, 5000), {
+    provider: 'cpx',
+    uid: 'phone_917600140353',
+    transactionId,
+    originalTransactionId: transactionId,
+    placementIdentifier: '',
+    payoutUsdMicros: 800000,
+    userRewardUsdMicros: 400000,
+    isChargeback: false,
+    isSandbox: false,
+    eventType: 'complete',
+  });
+
+  const reversal = completion.replace('status=1', 'status=2');
+  const parsedReversal = verifyCpxCallback(reversal, secret, 5000);
+  assert.equal(parsedReversal.transactionId, `${transactionId}_reversal`);
+  assert.equal(parsedReversal.originalTransactionId, transactionId);
+  assert.equal(parsedReversal.isChargeback, true);
+  assert.throws(
+    () => verifyCpxCallback(completion.replace(hash, '0'.repeat(32)), secret, 5000),
     /signature/,
   );
 });

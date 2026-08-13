@@ -103,6 +103,14 @@ const CPX_APP_SECURE_HASH = String(
   process.env.CPX_APP_SECURE_HASH || '',
 ).trim();
 const CPX_USER_SHARE_BPS = Number(process.env.CPX_USER_SHARE_BPS || 5000);
+const ADGEM_ENABLED =
+  String(process.env.ADGEM_ENABLED || 'false').toLowerCase() === 'true';
+const ADGEM_POSTBACK_KEY = String(
+  process.env.ADGEM_POSTBACK_KEY || '',
+).trim();
+const ADGEM_MAX_COINS_PER_CALLBACK = Number(
+  process.env.ADGEM_MAX_COINS_PER_CALLBACK || 1000,
+);
 const AYET_ENABLED =
   String(process.env.AYET_ENABLED || 'false').toLowerCase() === 'true';
 const AYET_API_KEY = String(process.env.AYET_API_KEY || '').trim();
@@ -147,6 +155,16 @@ function ensureConfiguration() {
       CPX_USER_SHARE_BPS > 9000)
   ) {
     missing.push('CPX_USER_SHARE_BPS (integer from 1 to 9000)');
+  }
+  if (ADGEM_ENABLED && !ADGEM_POSTBACK_KEY) {
+    missing.push('ADGEM_POSTBACK_KEY');
+  }
+  if (
+    ADGEM_ENABLED &&
+    (!Number.isSafeInteger(ADGEM_MAX_COINS_PER_CALLBACK) ||
+      ADGEM_MAX_COINS_PER_CALLBACK < 1)
+  ) {
+    missing.push('ADGEM_MAX_COINS_PER_CALLBACK (positive integer)');
   }
   if (AYET_ENABLED && !AYET_API_KEY) missing.push('AYET_API_KEY');
   if (
@@ -629,6 +647,71 @@ function verifyBitLabsCallback(fullUrl, secret) {
   return { uid, transactionId, coins, usdValue };
 }
 
+function adgemUnsignedUrl(fullUrl) {
+  const parsed = new URL(String(fullUrl || ''));
+  parsed.searchParams.delete('verifier');
+  return parsed.href;
+}
+
+function adgemSignature(fullUrl, secret) {
+  return crypto
+    .createHmac('sha256', String(secret || ''))
+    .update(adgemUnsignedUrl(fullUrl), 'utf8')
+    .digest('hex');
+}
+
+function verifyAdgemCallback(fullUrl, secret) {
+  if (!secret) throw new Error('AdGem postback key is not configured.');
+  const parsed = new URL(String(fullUrl || ''));
+  const suppliedVerifier = parsed.searchParams.get('verifier');
+  if (!/^[a-f0-9]{64}$/i.test(String(suppliedVerifier || ''))) {
+    throw new Error('Malformed AdGem callback verifier.');
+  }
+  const expectedVerifier = adgemSignature(fullUrl, secret);
+  if (!safeHexEqual(expectedVerifier, suppliedVerifier)) {
+    throw new Error('Invalid AdGem callback verifier.');
+  }
+
+  const requestId = parsed.searchParams.get('request_id');
+  const uid = parsed.searchParams.get('c1');
+  const playerId = parsed.searchParams.get('player_id');
+  const transactionId = parsed.searchParams.get('transaction_id');
+  const coins = Number(parsed.searchParams.get('amount'));
+  const payout = Number(parsed.searchParams.get('payout'));
+  const country = String(parsed.searchParams.get('country') || '').toUpperCase();
+  const goalId = String(parsed.searchParams.get('goal_id') || '');
+  const offerId = String(parsed.searchParams.get('offer_id') || '');
+
+  if (
+    !/^[A-Za-z0-9-]{8,128}$/.test(String(requestId || '')) ||
+    !validFirebaseUid(uid) ||
+    !/^[a-f0-9]{64}$/.test(String(playerId || '')) ||
+    !/^[A-Za-z0-9:_-]{1,160}$/.test(String(transactionId || '')) ||
+    !Number.isSafeInteger(coins) ||
+    coins < 1 ||
+    coins > ADGEM_MAX_COINS_PER_CALLBACK ||
+    !Number.isFinite(payout) ||
+    payout < 0 ||
+    (country && !/^[A-Z]{2}$/.test(country)) ||
+    (goalId && !/^[A-Za-z0-9:_-]{1,160}$/.test(goalId)) ||
+    (offerId && !/^[A-Za-z0-9:_-]{1,160}$/.test(offerId))
+  ) {
+    throw new Error('AdGem callback values failed validation.');
+  }
+
+  return {
+    requestId: String(requestId),
+    uid: String(uid),
+    playerId: String(playerId),
+    transactionId: String(transactionId),
+    coins,
+    payout,
+    country,
+    goalId,
+    offerId,
+  };
+}
+
 function cpxSignature(transactionId, secret) {
   return crypto
     .createHash('md5')
@@ -871,6 +954,98 @@ async function grantVerifiedAdReward(callback) {
       coins: COINS_PER_REWARD,
       lifetimeVerifiedAds,
     };
+  });
+}
+
+async function grantAdgemOfferReward(callback) {
+  const {
+    requestId,
+    uid,
+    transactionId,
+    coins,
+    payout,
+    country,
+    goalId,
+    offerId,
+  } = callback;
+  const authUser = await firebaseAuth.getUser(uid);
+  const verifiedAccount =
+    authUser.emailVerified === true ||
+    Boolean(authUser.phoneNumber) ||
+    authUser.customClaims?.phone_verified === true;
+  if (!verifiedAccount) throw new Error('Offer user is not verified.');
+
+  const requestRef = firestore
+    .collection('offerPostbackRequests')
+    .doc(`adgem_${requestId}`);
+  const claimRef = firestore
+    .collection('offerClaims')
+    .doc(`adgem_${transactionId}`);
+  const walletRef = firestore.collection('wallets').doc(uid);
+  const userRef = firestore.collection('users').doc(uid);
+  const transactionRef = firestore
+    .collection('transactions')
+    .doc(`adgem_${transactionId}`);
+
+  return firestore.runTransaction(async (transaction) => {
+    const [requestSnapshot, claimSnapshot, userSnapshot, walletSnapshot] =
+      await Promise.all([
+        transaction.get(requestRef),
+        transaction.get(claimRef),
+        transaction.get(userRef),
+        transaction.get(walletRef),
+      ]);
+    if (requestSnapshot.exists || claimSnapshot.exists) {
+      return { duplicate: true, credited: false };
+    }
+    if (!userSnapshot.exists) throw new Error('Offer user does not exist.');
+
+    const currentCoins = Number(walletSnapshot.data()?.coins || 0);
+    const nextCoins = currentCoins + coins;
+    if (
+      !Number.isSafeInteger(currentCoins) ||
+      currentCoins < 0 ||
+      !Number.isSafeInteger(nextCoins)
+    ) {
+      throw new Error('Reward wallet value is invalid.');
+    }
+
+    const createdAt = FieldValue.serverTimestamp();
+    transaction.set(
+      walletRef,
+      { uid, coins: nextCoins, updatedAt: createdAt },
+      { merge: true },
+    );
+    transaction.create(requestRef, {
+      provider: 'adgem',
+      requestId,
+      providerTransactionId: transactionId,
+      createdAt,
+    });
+    transaction.create(claimRef, {
+      provider: 'adgem',
+      userId: uid,
+      requestId,
+      providerTransactionId: transactionId,
+      coins,
+      payout,
+      country,
+      goalId,
+      offerId,
+      credited: true,
+      createdAt,
+    });
+    transaction.create(transactionRef, {
+      userId: uid,
+      type: 'offer_reward',
+      provider: 'adgem',
+      coins,
+      balanceAfter: nextCoins,
+      providerTransactionId: transactionId,
+      providerPayout: payout,
+      createdAt,
+    });
+    return { duplicate: false, credited: true, coins };
   });
 }
 
@@ -2877,6 +3052,38 @@ app.get('/ayet/reward', async (request, response) => {
   }
 });
 
+app.get('/rewards/adgem/postback', async (request, response) => {
+  if (!ADGEM_ENABLED) {
+    return response.status(503).send('Provider disabled');
+  }
+  try {
+    const forwardedProtocol = String(
+      request.headers['x-forwarded-proto'] || request.protocol,
+    )
+      .split(',')[0]
+      .trim();
+    const forwardedHost = String(
+      request.headers['x-forwarded-host'] || request.get('host'),
+    )
+      .split(',')[0]
+      .trim();
+    const fullUrl =
+      `${forwardedProtocol}://${forwardedHost}${request.originalUrl}`;
+    const callback = verifyAdgemCallback(fullUrl, ADGEM_POSTBACK_KEY);
+    const result = await grantAdgemOfferReward(callback);
+    console.info('Verified AdGem reward callback processed:', {
+      requestId: callback.requestId,
+      transactionId: callback.transactionId,
+      credited: result.credited,
+      duplicate: result.duplicate,
+    });
+    return response.status(200).send('OK');
+  } catch (error) {
+    console.warn('Rejected AdGem reward callback:', error.message);
+    return response.status(400).send('Invalid callback');
+  }
+});
+
 app.get('/cpx/reward', async (request, response) => {
   if (!CPX_ENABLED) {
     return response.status(503).send('Provider disabled');
@@ -2961,6 +3168,9 @@ module.exports = {
   bitLabsSignature,
   stripBitLabsHash,
   verifyBitLabsCallback,
+  adgemUnsignedUrl,
+  adgemSignature,
+  verifyAdgemCallback,
   cpxSignature,
   verifyCpxCallback,
   verifyEcdsaSignature,
